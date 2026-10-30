@@ -1,0 +1,15 @@
+# ============================================================
+# Docker Compose - Development Overrides
+#
+# Usage:
+# docker compose \
+#   -f deploy/docker-compose.yml \
+#   -f deploy/docker-compose.dev.yml \
+#   up -d
+# ============================================================
+include:
+  - path: docker-compose.yml
+services:
+  app:
+    environment:
+      APP_ENV: development

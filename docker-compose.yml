@@ -1,0 +1,28 @@
+# ============================================================
+# Docker Compose - Base Configuration
+#
+# Shared configuration for DEV and PROD.
+# Image is built and published by GitHub Actions to Harbor.
+# ============================================================
+
+services:
+
+  app:
+    image: "${REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG:-latest}"
+    container_name: "${CONTAINER_NAME:-application}"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3000}:${CONTAINER_PORT:-3000}"
+    environment:
+      APP_ENV: "${APP_ENV:-production}"
+    networks:
+      - proxy_net
+    labels:
+      caddy: http://webtest.dev.facuynati.website
+      caddy.reverse_proxy: "{{upstreams 80}}" # Reemplaza 3000 por el puerto interno del contenedor
+
+networks:
+  proxy_net:
+    external: true
