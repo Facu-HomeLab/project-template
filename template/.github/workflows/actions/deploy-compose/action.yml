@@ -1,0 +1,38 @@
+name: Deploy with Docker Compose
+description: Copy declared deployment files and update the remote Compose project.
+inputs:
+  secret_file: { required: true }
+  ssh_dir: { required: true }
+  image: { required: true }
+  version: { required: true }
+  repo_slug: { required: true }
+  compose_file: { required: true }
+  deploy_files: { required: false, default: '' }
+  verify_health: { required: false, default: 'true' }
+  health_timeout: { required: false, default: '120' }
+  harbor_registry: { required: true }
+  robot_name: { required: true }
+  robot_secret_file: { required: true }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SECRET_FILE: ${{ inputs.secret_file }}
+        SSH_DIR: ${{ inputs.ssh_dir }}
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+        REPO_SLUG: ${{ inputs.repo_slug }}
+        COMPOSE_FILE: ${{ inputs.compose_file }}
+        DEPLOY_FILES: ${{ inputs.deploy_files }}
+        VERIFY_HEALTH: ${{ inputs.verify_health }}
+        HEALTH_TIMEOUT: ${{ inputs.health_timeout }}
+        HARBOR_REGISTRY: ${{ inputs.harbor_registry }}
+        ROBOT_NAME: ${{ inputs.robot_name }}
+        ROBOT_SECRET_FILE: ${{ inputs.robot_secret_file }}
+      run: |
+        set -Eeuo pipefail
+        source "$GITHUB_ACTION_PATH/../../scripts/deploy.sh"
+        deploy_compose "$SECRET_FILE" "$SSH_DIR" "$IMAGE" "$VERSION" "$REPO_SLUG" \
+          "$COMPOSE_FILE" "$DEPLOY_FILES" "$VERIFY_HEALTH" "$HEALTH_TIMEOUT" \
+          "$HARBOR_REGISTRY" "$ROBOT_NAME" "$ROBOT_SECRET_FILE"

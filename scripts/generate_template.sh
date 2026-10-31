@@ -1,307 +1,328 @@
 #!/usr/bin/env bash
-#
-# generate_template.sh
-#
-# Creates a new repository in the Facu-HomeLab GitHub organization,
-# populates it from Facu-HomeLab/project-template, configures it,
-# and pushes the initial project structure.
-#
-# Requirements:
-#   - bash, curl, tar, git, gh
-#   - gh authenticated with permission to create repositories in Facu-HomeLab
-#
 set -Eeuo pipefail
+IFS=$'\n\t'
 
 ORG="Facu-HomeLab"
-TEMPLATE_REPO="https://github.com/${ORG}/project-template"
-TEMPLATE_BRANCH="${TEMPLATE_BRANCH:-main}"
-ARCHIVE_URL="https://codeload.github.com/${ORG}/project-template/tar.gz/refs/heads/${TEMPLATE_BRANCH}"
+SOURCE_REPO="https://github.com/${ORG}/project-template.git"
+SOURCE_BRANCH="main"
 
-log()  { printf '\n\033[1;34m[INFO]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\n\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./generate_template.sh
+  ./generate_template.sh --name NAME --description TEXT \
+    --dev-hostname HOST --prod-hostname HOST \
+    --dev-target TARGET --prod-target TARGET
 
-ask() {
-  local prompt="$1" default="${2:-}" answer
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " answer </dev/tty
-    printf '%s' "${answer:-$default}"
+Options:
+  --name NAME              Project/repository name
+  --description TEXT       Project description
+  --dev-hostname HOST      Development hostname
+  --prod-hostname HOST     Production hostname
+  --dev-target TARGET      Development deployment target
+  --prod-target TARGET     Production deployment target
+  -h, --help               Show this help
+
+Interactive mode offers defaults; press Enter to accept one.
+In CLI mode all six options are required.
+The script creates ./$NAME, which must not already exist.
+
+Dependencies: bash, gh, git, and standard Unix utilities (including awk).
+USAGE
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+info() { printf '\n==> %s\n' "$*"; }
+need_command() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+validate_single_line() {
+  local label="$1" value="$2"
+  [[ -n "${value//[[:space:]]/}" ]] || die "$label cannot be empty."
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "$label must be a single line."
+}
+validate_project_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ && "$1" != "." && "$1" != ".." && "$1" != -* ]] ||
+    die "Invalid project name '$1'. Use letters, numbers, '.', '_' or '-'."
+}
+validate_hostname() {
+  local label="$1" value="$2"
+  validate_single_line "$label" "$value"
+  [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
+    die "$label must be a hostname without scheme, path, or port."
+  [[ "$value" != *..* && "$value" != *.-* && "$value" != *-. ]] ||
+    die "$label contains an invalid hostname sequence."
+}
+prompt_value() {
+  local var_name="$1" label="$2" default="$3" value=""
+  while true; do
+    read -r -p "${label} [${default}]: " value
+    value="${value:-$default}"
+    if [[ -n "${value//[[:space:]]/}" ]]; then
+      printf -v "$var_name" '%s' "$value"
+      return
+    fi
+    printf 'This field is required.\n' >&2
+  done
+}
+
+PROJECT_NAME=""
+DESCRIPTION=""
+DEV_HOSTNAME=""
+PROD_HOSTNAME=""
+DEV_TARGET=""
+PROD_TARGET=""
+CLI_MODE=false
+declare -A SEEN=()
+
+while (($#)); do
+  case "$1" in
+    --name|--description|--dev-hostname|--prod-hostname|--dev-target|--prod-target)
+      (($# >= 2)) || die "$1 requires a value"
+      key="$1"; value="$2"
+      case "$key" in
+        --name) PROJECT_NAME="$value" ;;
+        --description) DESCRIPTION="$value" ;;
+        --dev-hostname) DEV_HOSTNAME="$value" ;;
+        --prod-hostname) PROD_HOSTNAME="$value" ;;
+        --dev-target) DEV_TARGET="$value" ;;
+        --prod-target) PROD_TARGET="$value" ;;
+      esac
+      SEEN["$key"]=1
+      CLI_MODE=true
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown argument: $1 (use --help)" ;;
+  esac
+done
+
+need_command gh
+need_command git
+need_command awk
+gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run: gh auth login."
+gh api "orgs/${ORG}" >/dev/null 2>&1 ||
+  die "Cannot access organization ${ORG}; check membership and permissions."
+
+if [[ "$CLI_MODE" == false ]]; then
+  prompt_value PROJECT_NAME "Project name" "my-project"
+  validate_project_name "$PROJECT_NAME"
+  prompt_value DESCRIPTION "Project description" "$PROJECT_NAME"
+  prompt_value DEV_HOSTNAME "Development hostname" "${PROJECT_NAME}.dev.facuynati.online"
+  prompt_value PROD_HOSTNAME "Production hostname" "${PROJECT_NAME}.facuynati.online"
+  prompt_value DEV_TARGET "Development deployment target" "proxmox-dev"
+  prompt_value PROD_TARGET "Production deployment target" "proxmox-prod"
+else
+  for option in --name --description --dev-hostname --prod-hostname --dev-target --prod-target; do
+    [[ -n "${SEEN[$option]:-}" ]] || die "CLI mode requires $option."
+  done
+fi
+
+validate_project_name "$PROJECT_NAME"
+validate_single_line "Description" "$DESCRIPTION"
+validate_hostname "Development hostname" "$DEV_HOSTNAME"
+validate_hostname "Production hostname" "$PROD_HOSTNAME"
+validate_single_line "Development target" "$DEV_TARGET"
+validate_single_line "Production target" "$PROD_TARGET"
+
+REPO_FULL_NAME="${ORG}/${PROJECT_NAME}"
+TARGET_DIR="${PWD}/${PROJECT_NAME}"
+[[ ! -e "$TARGET_DIR" ]] || die "Local destination already exists: $TARGET_DIR"
+if gh repo view "$REPO_FULL_NAME" >/dev/null 2>&1; then
+  die "GitHub repository already exists: $REPO_FULL_NAME"
+fi
+
+printf '\nConfiguration:\n'
+printf '  Repository:   %s (private)\n' "$REPO_FULL_NAME"
+printf '  Description:  %s\n' "$DESCRIPTION"
+printf '  Dev hostname: %s\n' "$DEV_HOSTNAME"
+printf '  Prod hostname: %s\n' "$PROD_HOSTNAME"
+printf '  Dev target:   %s\n' "$DEV_TARGET"
+printf '  Prod target:  %s\n' "$PROD_TARGET"
+if [[ "$CLI_MODE" == false ]]; then
+  read -r -p "Create repository and publish template? [Y/n]: " confirm
+  [[ -z "$confirm" || "$confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || die "Cancelled."
+fi
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+info "Cloning source template"
+git clone --quiet --depth 1 --branch "$SOURCE_BRANCH" "$SOURCE_REPO" "$TMP_DIR/source"
+[[ -d "$TMP_DIR/source/template" ]] || die "Source repository does not contain template/."
+[[ -f "$TMP_DIR/source/template/.env.example" ]] || die "Template is missing .env.example."
+[[ -f "$TMP_DIR/source/template/config/project.yaml" ]] || die "Template is missing config/project.yaml."
+
+info "Creating private repository"
+gh repo create "$REPO_FULL_NAME" --private --description "$DESCRIPTION"
+
+info "Cloning new repository"
+git clone --quiet "https://github.com/${REPO_FULL_NAME}.git" "$TARGET_DIR"
+
+info "Copying template contents"
+cp -a "$TMP_DIR/source/template/." "$TARGET_DIR/"
+
+ENV_EXAMPLE="${TARGET_DIR}/.env.example"
+ENV_FILE="${TARGET_DIR}/.env"
+YAML_FILE="${TARGET_DIR}/config/project.yaml"
+[[ -f "$ENV_EXAMPLE" ]] || die "Copied template is missing .env.example."
+[[ -f "$YAML_FILE" ]] || die "Copied template is missing config/project.yaml."
+
+info "Generating .env from .env.example"
+# Bash reads .env.example line by line, replacing known variables and preserving
+# comments, blank lines, ordering, and variables added by future template versions.
+declare -A ENV_VALUES=(
+  [REGISTRY]="reg.internal.facuynati.website"
+  [HARBOR_PROJECT]="applications"
+  [IMAGE_NAME]="$PROJECT_NAME"
+  [IMAGE_TAG]="latest"
+  [CONTAINER_NAME]="$PROJECT_NAME"
+  [BIND_ADDRESS]="127.0.0.1"
+  [HOST_PORT]="3000"
+  [CONTAINER_PORT]="80"
+  [APP_ENV]="development"
+  [APP_HOSTNAME]="$DEV_HOSTNAME"
+  [APP_UPSTREAM]="127.0.0.1:80"
+)
+declare -A ENV_SEEN=()
+: > "$ENV_FILE"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
+    key="${BASH_REMATCH[1]}"
+    if [[ -v "ENV_VALUES[$key]" ]]; then
+      printf '%s=%s\n' "$key" "${ENV_VALUES[$key]}" >> "$ENV_FILE"
+      ENV_SEEN["$key"]=1
+    else
+      printf '%s\n' "$line" >> "$ENV_FILE"
+    fi
   else
-    read -r -p "$prompt: " answer </dev/tty
-    printf '%s' "$answer"
+    printf '%s\n' "$line" >> "$ENV_FILE"
   fi
-}
+done < "$ENV_EXAMPLE"
 
-slugify() {
-  printf '%s' "$1" |
-    tr '[:upper:]' '[:lower:]' |
-    sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
-}
+for key in "${!ENV_VALUES[@]}"; do
+  [[ -n "${ENV_SEEN[$key]:-}" ]] ||
+    die "Template .env.example is missing expected key: $key"
+done
+chmod 600 "$ENV_FILE"
 
+info "Updating config/project.yaml"
+# YAML values are emitted as single-quoted scalars; embedded apostrophes double.
 yaml_quote() {
-  local value="${1//\'/\'\'}"
+  local value="$1"
+  value="${value//\'/\'\'}"
   printf "'%s'" "$value"
 }
+export YAML_PROJECT_NAME="$(yaml_quote "$PROJECT_NAME")"
+export YAML_PROJECT_DESCRIPTION="$(yaml_quote "$DESCRIPTION")"
+export YAML_ORG="$(yaml_quote "$ORG")"
+export YAML_REGISTRY="$(yaml_quote "reg.internal.facuynati.website")"
+export YAML_HARBOR_PROJECT="$(yaml_quote "applications")"
+export YAML_IMAGE="$(yaml_quote "$PROJECT_NAME")"
+export YAML_CONTAINER_PORT="80"
+export YAML_DEV_HOSTNAME="$(yaml_quote "$DEV_HOSTNAME")"
+export YAML_PROD_HOSTNAME="$(yaml_quote "$PROD_HOSTNAME")"
+export YAML_DEV_TARGET="$(yaml_quote "$DEV_TARGET")"
+export YAML_PROD_TARGET="$(yaml_quote "$PROD_TARGET")"
 
-cleanup() {
-  [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
+YAML_TMP="${YAML_FILE}.tmp"
+awk '
+{
+  if ($0 ~ /^[A-Za-z0-9_-]+:[[:space:]]*$/) {
+    top = $0
+    sub(/:.*/, "", top)
+    subkey = ""
+  } else if (top == "deployment" && $0 ~ /^  (dev|prod):[[:space:]]*$/) {
+    subkey = $0
+    sub(/^[[:space:]]*/, "", subkey)
+    sub(/:.*/, "", subkey)
+  }
+
+  if (top == "project" && $0 ~ /^  name:[[:space:]]*/) {
+    print "  name: " ENVIRON["YAML_PROJECT_NAME"]; found["project.name"]=1; next
+  }
+  if (top == "project" && $0 ~ /^  description:[[:space:]]*/) {
+    print "  description: " ENVIRON["YAML_PROJECT_DESCRIPTION"]; found["project.description"]=1; next
+  }
+  if (top == "project" && $0 ~ /^  repository:[[:space:]]*/) {
+    print "  repository: " ENVIRON["YAML_PROJECT_NAME"]; found["project.repository"]=1; next
+  }
+  if (top == "project" && $0 ~ /^  organization:[[:space:]]*/) {
+    print "  organization: " ENVIRON["YAML_ORG"]; found["project.organization"]=1; next
+  }
+  if (top == "container" && $0 ~ /^  registry:[[:space:]]*/) {
+    print "  registry: " ENVIRON["YAML_REGISTRY"]; found["container.registry"]=1; next
+  }
+  if (top == "container" && $0 ~ /^  harbor_project:[[:space:]]*/) {
+    print "  harbor_project: " ENVIRON["YAML_HARBOR_PROJECT"]; found["container.harbor_project"]=1; next
+  }
+  if (top == "container" && $0 ~ /^  image:[[:space:]]*/) {
+    print "  image: " ENVIRON["YAML_IMAGE"]; found["container.image"]=1; next
+  }
+  if (top == "container" && $0 ~ /^  port:[[:space:]]*/) {
+    print "  port: " ENVIRON["YAML_CONTAINER_PORT"]; found["container.port"]=1; next
+  }
+  if (top == "deployment" && subkey == "dev" && $0 ~ /^    hostname:[[:space:]]*/) {
+    print "    hostname: " ENVIRON["YAML_DEV_HOSTNAME"]; found["deployment.dev.hostname"]=1; next
+  }
+  if (top == "deployment" && subkey == "dev" && $0 ~ /^    target:[[:space:]]*/) {
+    print "    target: " ENVIRON["YAML_DEV_TARGET"]; found["deployment.dev.target"]=1; next
+  }
+  if (top == "deployment" && subkey == "prod" && $0 ~ /^    hostname:[[:space:]]*/) {
+    print "    hostname: " ENVIRON["YAML_PROD_HOSTNAME"]; found["deployment.prod.hostname"]=1; next
+  }
+  if (top == "deployment" && subkey == "prod" && $0 ~ /^    target:[[:space:]]*/) {
+    print "    target: " ENVIRON["YAML_PROD_TARGET"]; found["deployment.prod.target"]=1; next
+  }
+  print
 }
-trap cleanup EXIT
+END {
+  required[1]="project.name"
+  required[2]="project.description"
+  required[3]="project.repository"
+  required[4]="project.organization"
+  required[5]="container.registry"
+  required[6]="container.harbor_project"
+  required[7]="container.image"
+  required[8]="container.port"
+  required[9]="deployment.dev.hostname"
+  required[10]="deployment.dev.target"
+  required[11]="deployment.prod.hostname"
+  required[12]="deployment.prod.target"
+  for (i=1; i<=12; i++) {
+    if (!found[required[i]]) {
+      print "Missing expected YAML key: " required[i] > "/dev/stderr"
+      failed=1
+    }
+  }
+  if (failed) exit 2
+}' "$YAML_FILE" > "$YAML_TMP" || {
+  rm -f "$YAML_TMP"
+  die "Could not update config/project.yaml; its structure differs from the expected template."
+}
+mv "$YAML_TMP" "$YAML_FILE"
 
-for cmd in bash curl tar git gh sed tr find; do
-  command -v "$cmd" >/dev/null 2>&1 || die "Falta el comando requerido: $cmd"
-done
+git -C "$TARGET_DIR" check-ignore -q .env ||
+  die ".env is not ignored by .gitignore; refusing to commit it."
+# Basic .env syntax check using Bash only.
+line_number=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  ((line_number += 1))
+  [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+  [[ "$line" == *=* ]] || die "Invalid .env line ${line_number}: missing '='"
+done < "$ENV_FILE"
 
-[[ -t 0 || -r /dev/tty ]] || die "Este script necesita un terminal interactivo."
+info "Creating initial commit"
+git -C "$TARGET_DIR" add -A
+git -C "$TARGET_DIR" diff --cached --quiet && die "No changes to commit."
+git -C "$TARGET_DIR" -c user.name="$(git config user.name || gh api user --jq .login)" \
+  -c user.email="$(git config user.email || printf '%s@users.noreply.github.com' "$(gh api user --jq .id)")" \
+  commit -m "chore: initialize project from template"
+git -C "$TARGET_DIR" branch -M main
+git -C "$TARGET_DIR" push -u origin main
 
-gh auth status >/dev/null 2>&1 ||
-  die "GitHub CLI no está autenticado. Ejecutá primero: gh auth login"
-
-log "Configuración del nuevo proyecto"
-
-PROJECT_NAME="$(ask 'Nombre del proyecto (ej. my-api)')"
-[[ -n "$PROJECT_NAME" ]] || die "El nombre del proyecto es obligatorio."
-
-REPO_NAME="$(slugify "$PROJECT_NAME")"
-[[ "$REPO_NAME" =~ ^[a-z0-9]+([.-][a-z0-9]+)*$ ]] ||
-  die "El nombre del repositorio no es válido: $REPO_NAME"
-
-DESCRIPTION="$(ask 'Descripción breve' "Application generated from Facu-HomeLab project-template")"
-VISIBILITY="$(ask 'Visibilidad del repositorio (private/public)' 'private')"
-[[ "$VISIBILITY" == "private" || "$VISIBILITY" == "public" ]] ||
-  die "La visibilidad debe ser private o public."
-
-REGISTRY="$(ask 'Harbor registry' 'reg.internal.facuynati.website')"
-HARBOR_PROJECT="$(ask 'Harbor project' 'applications')"
-CONTAINER_PORT="$(ask 'Puerto interno del contenedor' '80')"
-HOST_PORT="$(ask 'Puerto local publicado en el host' '3000')"
-BASE_DOMAIN="$(ask 'Dominio base' 'facuynati.online')"
-DEV_HOSTNAME="$(ask 'Hostname DEV' "${REPO_NAME}.dev.${BASE_DOMAIN}")"
-PROD_HOSTNAME="$(ask 'Hostname PROD' "${REPO_NAME}.${BASE_DOMAIN}")"
-DEV_TARGET="$(ask 'Target DEV' 'proxmox-dev')"
-PROD_TARGET="$(ask 'Target PROD' 'proxmox-prod')"
-HEALTHCHECK_PATH="$(ask 'Healthcheck path' '/health')"
-
-[[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] && (( CONTAINER_PORT >= 1 && CONTAINER_PORT <= 65535 )) ||
-  die "Puerto interno inválido."
-[[ "$HOST_PORT" =~ ^[0-9]+$ ]] && (( HOST_PORT >= 1 && HOST_PORT <= 65535 )) ||
-  die "Puerto del host inválido."
-[[ "$REGISTRY" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || die "Registry inválido."
-[[ "$HARBOR_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "Harbor project inválido."
-[[ "$BASE_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "Dominio base inválido."
-
-PROJECT_DIR="$PWD"
-[[ -z "$(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] ||
-  die "La carpeta actual no está vacía. Ejecutá el script desde una carpeta nueva y vacía."
-
-FULL_REPO="${ORG}/${REPO_NAME}"
-if gh repo view "$FULL_REPO" >/dev/null 2>&1; then
-  die "El repositorio ${FULL_REPO} ya existe. Elegí otro nombre o revisá GitHub."
-fi
-
-WORK_DIR="$(mktemp -d -t facu-project-template.XXXXXX)"
-ARCHIVE="$WORK_DIR/template.tar.gz"
-SOURCE_DIR="$WORK_DIR/source"
-
-log "Descargando ${TEMPLATE_REPO} (rama ${TEMPLATE_BRANCH})..."
-curl --fail --silent --show-error --location "$ARCHIVE_URL" --output "$ARCHIVE" ||
-  die "No se pudo descargar el repositorio template."
-mkdir -p "$SOURCE_DIR"
-tar -xzf "$ARCHIVE" --strip-components=1 -C "$SOURCE_DIR" ||
-  die "No se pudo extraer el repositorio template."
-
-# Copiamos solamente los archivos solicitados. README y .env se generan
-# específicamente para el nuevo proyecto; project.yaml se configura abajo.
-FILES=(
-  ".dockerignore"
-  ".gitattributes"
-  ".gitignore"
-  "Dockerfile"
-  "docker-compose.yml"
-  "docker-compose.dev.yml"
-  "docker-compose.prod.yml"
-  ".github/PULL_REQUEST_TEMPLATE.md"
-  ".github/workflows/ci.yml"
-  ".github/workflows/deploy.yml"
-  ".github/workflows/runner-test.yml"
-  "src/.gitkeep"
-)
-for relative_path in "${FILES[@]}"; do
-  [[ -f "$SOURCE_DIR/$relative_path" ]] ||
-    die "El template no contiene el archivo esperado: $relative_path"
-  mkdir -p "$PROJECT_DIR/$(dirname "$relative_path")"
-  cp "$SOURCE_DIR/$relative_path" "$PROJECT_DIR/$relative_path"
-done
-
-mkdir -p config
-
-# Configuración central del proyecto.
-cat > config/project.yaml <<EOF
-# Generated by generate_template.sh
-project:
-  name: $(yaml_quote "$PROJECT_NAME")
-  description: $(yaml_quote "$DESCRIPTION")
-  repository: $(yaml_quote "$REPO_NAME")
-  organization: $(yaml_quote "$ORG")
-
-container:
-  registry: $(yaml_quote "$REGISTRY")
-  harbor_project: $(yaml_quote "$HARBOR_PROJECT")
-  image: $(yaml_quote "$REPO_NAME")
-  port: ${CONTAINER_PORT}
-
-deployment:
-  provider: docker-compose
-  dev:
-    enabled: true
-    hostname: $(yaml_quote "$DEV_HOSTNAME")
-    environment: development
-    target: $(yaml_quote "$DEV_TARGET")
-  prod:
-    enabled: true
-    hostname: $(yaml_quote "$PROD_HOSTNAME")
-    environment: production
-    target: $(yaml_quote "$PROD_TARGET")
-
-healthcheck:
-  path: $(yaml_quote "$HEALTHCHECK_PATH")
-  interval: 30
-EOF
-
-# Environment local. IMAGE is also understood by the central deployment
-# workflow, which exports IMAGE with the release tag on the remote host.
-cat > .env <<EOF
-# Generated for ${FULL_REPO}
-# Do not commit secrets to this file.
-
-REGISTRY=${REGISTRY}
-HARBOR_PROJECT=${HARBOR_PROJECT}
-IMAGE_NAME=${REPO_NAME}
-IMAGE_TAG=latest
-IMAGE=${REGISTRY}/${HARBOR_PROJECT}/${REPO_NAME}:latest
-CONTAINER_NAME=${REPO_NAME}
-
-BIND_ADDRESS=127.0.0.1
-HOST_PORT=${HOST_PORT}
-CONTAINER_PORT=${CONTAINER_PORT}
-
-APP_ENV=development
-APP_HOSTNAME=${DEV_HOSTNAME}
-APP_UPSTREAM=app:${CONTAINER_PORT}
-EOF
-
-# Keep a matching example file, but without project-specific secret values.
-cp .env .env.example
-sed -i 's/^# Generated for .*/# Copy this file to .env and adjust the values./' .env.example
-
-# The template Compose file previously had a fixed demo hostname and port.
-# Make it use the generated environment variables instead.
-cat > docker-compose.yml <<'EOF'
-services:
-  app:
-    image: "${IMAGE:?Set IMAGE in .env or deployment environment}"
-    container_name: "${CONTAINER_NAME:-application}"
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3000}:${CONTAINER_PORT:-80}"
-    environment:
-      APP_ENV: "${APP_ENV:-production}"
-    networks:
-      - proxy_net
-    labels:
-      caddy: "${APP_HOSTNAME}"
-      caddy.reverse_proxy: "{{upstreams ${CONTAINER_PORT:-80}}}"
-
-networks:
-  proxy_net:
-    external: true
-EOF
-
-# The template workflow's compose path was deploy/docker-compose.yml,
-# while this generated layout places Compose files in the repository root.
-sed -i 's#compose_file: deploy/docker-compose.yml#compose_file: docker-compose.yml#' .github/workflows/deploy.yml
-
-# Generic project README, customized with project metadata.
-cat > README.md <<EOF
-# ${PROJECT_NAME}
-
-${DESCRIPTION}
-
-This repository was generated from [Facu-HomeLab/project-template](${TEMPLATE_REPO}).
-
-## Project configuration
-
-| Setting | Value |
-|---|---|
-| GitHub repository | [${FULL_REPO}](https://github.com/${FULL_REPO}) |
-| Container registry | \`${REGISTRY}\` |
-| Harbor project | \`${HARBOR_PROJECT}\` |
-| Image | \`${REPO_NAME}\` |
-| Container port | \`${CONTAINER_PORT}\` |
-| Host port | \`${HOST_PORT}\` |
-| DEV hostname | \`${DEV_HOSTNAME}\` |
-| PROD hostname | \`${PROD_HOSTNAME}\` |
-
-## Repository layout
-
-- \`src/\`: application source code
-- \`config/project.yaml\`: project and deployment configuration
-- \`docker-compose.yml\`: base container configuration
-- \`docker-compose.dev.yml\`: development overrides
-- \`docker-compose.prod.yml\`: production overrides
-- \`.github/workflows/\`: CI, deployment and runner validation workflows
-
-## Local setup
-
-1. Review \`.env\` and \`config/project.yaml\`.
-2. Add your application code under \`src/\`.
-3. Adapt the \`Dockerfile\` to your application runtime and build process.
-4. Ensure the application listens on container port \`${CONTAINER_PORT}\`.
-5. Start the stack when the required external Docker network exists:
-
-   \`\`\`bash
-   docker compose --env-file .env -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-   \`\`\`
-
-## Deployment
-
-The deployment workflow calls the reusable workflow in \`Facu-HomeLab/.github\`.
-
-Release tags:
-
-- \`v1.2.3-dev.1\`: DEV
-- \`v1.2.3-rc.1\`: STAGING
-- \`v1.2.3\`: PROD
-
-Check the central workflow's required OpenBao, Harbor, SSH and runner configuration before creating a release.
-
-## Security
-
-- \`.env\` is local configuration and must not contain committed secrets.
-- GitHub deployment credentials are supplied through the configured OIDC/OpenBao flow.
-- Review the generated configuration before deploying to production.
-EOF
-
-# Verify that .env is ignored.
-if ! grep -qxF '.env' .gitignore; then
-  printf '\n.env\n' >> .gitignore
-fi
-
-log "Archivos generados. Inicializando Git..."
-git init -b main
-git add .
-git -c user.name="Facu-HomeLab Template Generator" \
-    -c user.email="template-generator@users.noreply.github.com" \
-    commit -m "Initial project generated from Facu-HomeLab template"
-
-log "Creando el repositorio ${FULL_REPO} (${VISIBILITY}) y publicando main..."
-gh repo create "$FULL_REPO" "--${VISIBILITY}" --source=. --remote=origin --push ||
-  die "No se pudo crear/publicar el repositorio. Los archivos locales permanecen en $PROJECT_DIR."
-
-ok "Proyecto generado y publicado."
-printf '\nRepositorio: https://github.com/%s\n' "$FULL_REPO"
-printf 'Directorio:  %s\n' "$PROJECT_DIR"
-printf '\nRevisá especialmente Dockerfile, puertos, APP_HOSTNAME y config/project.yaml antes del primer deploy.\n'
+info "Completed successfully"
+printf 'Repository: https://github.com/%s\n' "$REPO_FULL_NAME"
+printf 'Local path: %s\n' "$TARGET_DIR"
+printf 'Generated:  %s/.env\n' "$TARGET_DIR"
+printf 'Generated:  %s/config/project.yaml\n' "$TARGET_DIR"
+printf 'Docker Compose and Dockerfile were not modified.\n'

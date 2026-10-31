@@ -1,0 +1,233 @@
+
+name: Build, publish and deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to deploy (e.g. v0.1.0-dev.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+env:
+  BAO_ADDR: https://key.internal.facuynati.website
+  BAO_PATH_PREFIX: kv/data/Facu-HomeLab
+  # BAO_JWT_ROLE: github-actions
+  BAO_AUDIENCE: openbao
+
+  HARBOR_URL: https://reg.internal.facuynati.website
+  HARBOR_REGISTRY: reg.internal.facuynati.website
+
+  DOCKERFILE: Dockerfile
+  DOCKER_CONTEXT: .
+  COMPOSE_FILE: docker-compose.yml
+
+  VERIFY_HEALTH: 'true'
+  HEALTH_TIMEOUT: '120'
+
+
+jobs:
+
+  # ==================================================
+  # Resolve release metadata and validate tag
+  # ==================================================
+  resolve:
+    name: Resolve release
+    runs-on: [self-hosted, linux, x64, ephemeral, docker]
+
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      branch: ${{ steps.resolve.outputs.branch }}
+      secret_dir: ${{ steps.resolve.outputs.secret_dir }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_channel: ${{ steps.resolve.outputs.release_channel }}
+      repo_slug: ${{ steps.resolve.outputs.repo_slug }}
+      harbor_project: ${{ steps.resolve.outputs.harbor_project }}
+      image: ${{ steps.resolve.outputs.image }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      jwt_role: ${{ steps.resolve.outputs.jwt_role }}
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve release and validate source branch
+        id: resolve
+        shell: bash
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          HARBOR_REGISTRY: ${{ env.HARBOR_REGISTRY }}
+        run: |
+          set -Eeuo pipefail
+
+          source "${GITHUB_WORKSPACE}/.github/workflows/scripts/common.sh"
+
+          # Resolve the actual commit referenced by the release tag.
+          git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" \
+            >/dev/null || die "Git tag '${TAG}' does not exist."
+
+          SHA="$(git rev-parse "${TAG}^{commit}")"
+
+          log "Requested TAG: '${TAG}'"
+
+          resolve_release "$TAG" "$REPOSITORY" "$HARBOR_REGISTRY"
+
+          log "Validation target: branch='${BRANCH}', environment='${ENVIRONMENT}'"
+
+          validate_release_branch "$BRANCH" "$SHA"
+
+          resolve_openbao_jwt_role "$BRANCH"
+
+          {
+            echo "environment=$ENVIRONMENT"
+            echo "branch=$BRANCH"
+            echo "secret_dir=$SECRET_DIR"
+            echo "version=$VERSION"
+            echo "release_channel=$RELEASE_CHANNEL"
+            echo "repo_slug=$REPO_SLUG"
+            echo "harbor_project=$HARBOR_PROJECT"
+            echo "image=$IMAGE"
+            echo "source_sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+
+  # ==================================================
+  # Build, publish and deploy
+  # ==================================================
+  deploy:
+    name: Build and deploy (${{ needs.resolve.outputs.environment }})
+    needs: resolve
+
+    runs-on: [self-hosted, linux, x64, ephemeral, docker]
+
+    environment: ${{ needs.resolve.outputs.environment }}
+
+    timeout-minutes: 30
+
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Validate runner and initialize state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          source "${GITHUB_WORKSPACE}/.github/workflows/scripts/common.sh"
+
+          require_commands curl jq git docker ssh scp ssh-keygen
+          docker compose version
+
+          mkdir -p "$RUNNER_TEMP/ci-cd-state"
+          chmod 700 "$RUNNER_TEMP/ci-cd-state"
+
+      # ----------------------------------------------
+      # OpenBao
+      # ----------------------------------------------
+      - name: OpenBao login and read deployment secrets
+        id: bao
+        uses: ./.github/workflows/actions/openbao-login
+        with:
+          bao_addr: ${{ env.BAO_ADDR }}
+          # jwt_role: ${{ env.BAO_JWT_ROLE }}
+          jwt_role: ${{ needs.resolve.outputs.jwt_role }}
+          audience: ${{ env.BAO_AUDIENCE }}
+          secret_path: ${{ env.BAO_PATH_PREFIX }}/${{ needs.resolve.outputs.secret_dir }}
+
+      # ----------------------------------------------
+      # Harbor
+      # ----------------------------------------------
+      - name: Ensure Harbor project
+        uses: ./.github/workflows/actions/harbor-project
+        with:
+          harbor_url: ${{ env.HARBOR_URL }}
+          project: ${{ needs.resolve.outputs.harbor_project }}
+          secret_file: ${{ steps.bao.outputs.secret_file }}
+
+      - name: Create temporary Harbor robot
+        id: robot
+        uses: ./.github/workflows/actions/harbor-robot
+        with:
+          harbor_url: ${{ env.HARBOR_URL }}
+          project: ${{ needs.resolve.outputs.harbor_project }}
+          secret_file: ${{ steps.bao.outputs.secret_file }}
+
+      # ----------------------------------------------
+      # Docker build and push
+      # ----------------------------------------------
+      - name: Build and push image
+        id: image
+        uses: ./.github/workflows/actions/docker-build-push
+        with:
+          image: ${{ needs.resolve.outputs.image }}
+          version: ${{ needs.resolve.outputs.version }}
+          environment: ${{ needs.resolve.outputs.environment }}
+          dockerfile: ${{ env.DOCKERFILE }}
+          context: ${{ env.DOCKER_CONTEXT }}
+          robot_name: ${{ steps.robot.outputs.robot_name }}
+          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
+
+      # ----------------------------------------------
+      # SSH
+      # ----------------------------------------------
+      - name: Prepare SSH
+        id: ssh
+        uses: ./.github/workflows/actions/ssh-prepare
+        with:
+          secret_file: ${{ steps.bao.outputs.secret_file }}
+
+      # ----------------------------------------------
+      # Remote deployment
+      # ----------------------------------------------
+      - name: Deploy with Docker Compose
+        uses: ./.github/workflows/actions/deploy-compose
+        with:
+          secret_file: ${{ steps.bao.outputs.secret_file }}
+          ssh_dir: ${{ steps.ssh.outputs.ssh_dir }}
+          image: ${{ needs.resolve.outputs.image }}
+          version: ${{ needs.resolve.outputs.version }}
+          repo_slug: ${{ needs.resolve.outputs.repo_slug }}
+          compose_file: ${{ env.COMPOSE_FILE }}
+          verify_health: ${{ env.VERIFY_HEALTH }}
+          health_timeout: ${{ env.HEALTH_TIMEOUT }}
+          harbor_registry: ${{ env.HARBOR_REGISTRY }}
+          robot_name: ${{ steps.robot.outputs.robot_name }}
+          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
+
+      # ----------------------------------------------
+      # Cleanup
+      # ----------------------------------------------
+      - name: Cleanup credentials and temporary resources
+        if: always()
+        uses: ./.github/workflows/actions/cleanup
+        with:
+          bao_addr: ${{ env.BAO_ADDR }}
+          harbor_url: ${{ env.HARBOR_URL }}
+          secret_file: ${{ steps.bao.outputs.secret_file }}
+          robot_state_file: ${{ steps.robot.outputs.robot_state_file }}
+          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
+          ssh_dir: ${{ steps.ssh.outputs.ssh_dir }}
+          harbor_registry: ${{ env.HARBOR_REGISTRY }}

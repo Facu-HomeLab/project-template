@@ -1,0 +1,27 @@
+name: Cleanup temporary credentials
+description: Best-effort cleanup of Harbor robot and local/remote credentials.
+inputs:
+  bao_addr: { required: true }
+  harbor_url: { required: true }
+  secret_file: { required: false, default: '' }
+  robot_state_file: { required: false, default: '' }
+  robot_secret_file: { required: false, default: '' }
+  ssh_dir: { required: false, default: '' }
+  harbor_registry: { required: true }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BAO_ADDR: ${{ inputs.bao_addr }}
+        HARBOR_URL: ${{ inputs.harbor_url }}
+        SECRET_FILE: ${{ inputs.secret_file }}
+        ROBOT_STATE_FILE: ${{ inputs.robot_state_file }}
+        ROBOT_SECRET_FILE: ${{ inputs.robot_secret_file }}
+        SSH_DIR: ${{ inputs.ssh_dir }}
+        HARBOR_REGISTRY: ${{ inputs.harbor_registry }}
+      run: |
+        set -Eeuo pipefail
+        source "$GITHUB_ACTION_PATH/../../scripts/cleanup.sh"
+        cleanup_all "$BAO_ADDR" "$HARBOR_URL" "$SECRET_FILE" "$ROBOT_STATE_FILE" \
+          "$ROBOT_SECRET_FILE" "$SSH_DIR" "$HARBOR_REGISTRY"

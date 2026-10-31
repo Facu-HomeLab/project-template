@@ -1,0 +1,27 @@
+name: Create temporary Harbor robot
+description: Create project-scoped pull/push robot credentials.
+inputs:
+  harbor_url: { required: true }
+  project: { required: true }
+  secret_file: { required: true }
+outputs:
+  robot_name: 
+    value: ${{ steps.create.outputs.robot_name }}
+  robot_secret_file:
+    value: ${{ steps.create.outputs.robot_secret_file }}
+  robot_state_file:
+    value: ${{ steps.create.outputs.robot_state_file }}
+runs:
+  using: composite
+  steps:
+    - id: create
+      shell: bash
+      env:
+        HARBOR_URL: ${{ inputs.harbor_url }}
+        PROJECT: ${{ inputs.project }}
+        SECRET_FILE: ${{ inputs.secret_file }}
+      run: |
+        set -Eeuo pipefail
+        source "$GITHUB_ACTION_PATH/../../scripts/harbor.sh"
+        create_robot "$HARBOR_URL" "$PROJECT" "$SECRET_FILE" "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          "${RUNNER_TEMP}/harbor-robot-secret" "${RUNNER_TEMP}/harbor-robot-state.json"

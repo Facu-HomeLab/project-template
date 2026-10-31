@@ -1,0 +1,27 @@
+name: OpenBao JWT login and KV read
+description: Authenticate with GitHub OIDC and read the environment KV v2 secret.
+inputs:
+  bao_addr: { required: true }
+  jwt_role: { required: true }
+  audience: { required: true }
+  secret_path: { required: true }
+outputs:
+  secret_file:
+    description: Path to protected JSON file containing deployment secrets
+    value: ${{ steps.login.outputs.secret_file }}
+runs:
+  using: composite
+  steps:
+    - id: login
+      shell: bash
+      env:
+        BAO_ADDR: ${{ inputs.bao_addr }}
+        JWT_ROLE: ${{ inputs.jwt_role }}
+        # JWT_ROLE: ${{ needs.resolve.outputs.jwt_role }}
+        AUDIENCE: ${{ inputs.audience }}
+        SECRET_PATH: ${{ inputs.secret_path }}
+      run: |
+        set -Eeuo pipefail
+        source "$GITHUB_ACTION_PATH/../../scripts/common.sh"
+        secret_file="$(bash "$GITHUB_ACTION_PATH/../../scripts/openbao.sh" "$BAO_ADDR" "$JWT_ROLE" "$AUDIENCE" "$SECRET_PATH")"
+        echo "secret_file=$secret_file" >> "$GITHUB_OUTPUT"
