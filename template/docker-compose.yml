@@ -3,6 +3,8 @@
 #
 # Shared configuration for DEV and PROD.
 # Image is built and published by GitHub Actions to Harbor.
+# Project-specific values (image, ports, Caddy hostname) are
+# filled in by scripts/generate_template.sh at project creation.
 # ============================================================
 
 services:
@@ -21,7 +23,7 @@ services:
       - proxy_net
     labels:
       caddy: http://webtest.dev.facuynati.website
-      caddy.reverse_proxy: "{{upstreams 80}}" # Reemplaza 3000 por el puerto interno del contenedor
+      caddy.reverse_proxy: "{{upstreams 80}}" # Internal container port, set at project creation
 
 networks:
   proxy_net:

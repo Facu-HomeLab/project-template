@@ -3,8 +3,17 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 ORG="Facu-HomeLab"
-SOURCE_REPO="https://github.com/${ORG}/project-template.git"
-SOURCE_BRANCH="main"
+SOURCE_REPO="${SOURCE_REPO:-https://github.com/${ORG}/project-template.git}"
+SOURCE_BRANCH="${SOURCE_BRANCH:-main}"
+
+# Shared values baked into .env, config/project.yaml and the Docker Compose
+# files. Change them here, never in the individual bake calls below.
+REGISTRY="reg.internal.facuynati.website"
+HARBOR_PROJECT="applications"
+IMAGE_TAG="latest"
+BIND_ADDRESS="127.0.0.1"
+HOST_PORT="3000"
+CONTAINER_PORT="80"
 
 usage() {
   cat <<'USAGE'
@@ -27,13 +36,33 @@ Interactive mode offers defaults; press Enter to accept one.
 In CLI mode all six options are required.
 The script creates ./$NAME, which must not already exist.
 
-Dependencies: bash, gh, git, and standard Unix utilities (including awk).
+Dependencies: bash, gh, git, and standard Unix utilities.
 USAGE
 }
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '\n==> %s\n' "$*"; }
 need_command() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+# bake FILE MATCH LINE — replace with LINE the single line that contains MATCH.
+# Dies unless MATCH is found exactly once; every templated value is filled
+# through here, so a drifting template fails loudly instead of silently.
+bake() {
+  local file="$1" match="$2" line="$3"
+  local count=0 tmp="${file}.bake.tmp" l
+  : > "$tmp"
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    if [[ "$l" == *"$match"* ]]; then
+      ((count += 1))
+      printf '%s\n' "$line" >> "$tmp"
+    else
+      printf '%s\n' "$l" >> "$tmp"
+    fi
+  done < "$file"
+  ((count == 1)) ||
+    { rm -f "$tmp"; die "$file: expected exactly one line containing '$match', found $count."; }
+  mv "$tmp" "$file"
+}
 
 validate_single_line() {
   local label="$1" value="$2"
@@ -98,7 +127,6 @@ done
 
 need_command gh
 need_command git
-need_command awk
 gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run: gh auth login."
 gh api "orgs/${ORG}" >/dev/null 2>&1 ||
   die "Cannot access organization ${ORG}; check membership and permissions."
@@ -149,8 +177,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 info "Cloning source template"
 git clone --quiet --depth 1 --branch "$SOURCE_BRANCH" "$SOURCE_REPO" "$TMP_DIR/source"
 [[ -d "$TMP_DIR/source/template" ]] || die "Source repository does not contain template/."
-[[ -f "$TMP_DIR/source/template/.env.example" ]] || die "Template is missing .env.example."
-[[ -f "$TMP_DIR/source/template/config/project.yaml" ]] || die "Template is missing config/project.yaml."
+for template_file in .env.example config/project.yaml \
+  docker-compose.yml docker-compose.dev.yml docker-compose.prod.yml; do
+  [[ -f "$TMP_DIR/source/template/$template_file" ]] ||
+    die "Template is missing $template_file."
+done
 
 info "Creating private repository"
 gh repo create "$REPO_FULL_NAME" --private --description "$DESCRIPTION"
@@ -164,24 +195,27 @@ cp -a "$TMP_DIR/source/template/." "$TARGET_DIR/"
 ENV_EXAMPLE="${TARGET_DIR}/.env.example"
 ENV_FILE="${TARGET_DIR}/.env"
 YAML_FILE="${TARGET_DIR}/config/project.yaml"
-[[ -f "$ENV_EXAMPLE" ]] || die "Copied template is missing .env.example."
-[[ -f "$YAML_FILE" ]] || die "Copied template is missing config/project.yaml."
+for generated_file in .env.example config/project.yaml \
+  docker-compose.yml docker-compose.dev.yml docker-compose.prod.yml; do
+  [[ -f "$TARGET_DIR/$generated_file" ]] ||
+    die "Copied template is missing $generated_file."
+done
 
 info "Generating .env from .env.example"
 # Bash reads .env.example line by line, replacing known variables and preserving
 # comments, blank lines, ordering, and variables added by future template versions.
 declare -A ENV_VALUES=(
-  [REGISTRY]="reg.internal.facuynati.website"
-  [HARBOR_PROJECT]="applications"
+  [REGISTRY]="$REGISTRY"
+  [HARBOR_PROJECT]="$HARBOR_PROJECT"
   [IMAGE_NAME]="$PROJECT_NAME"
-  [IMAGE_TAG]="latest"
+  [IMAGE_TAG]="$IMAGE_TAG"
   [CONTAINER_NAME]="$PROJECT_NAME"
-  [BIND_ADDRESS]="127.0.0.1"
-  [HOST_PORT]="3000"
-  [CONTAINER_PORT]="80"
+  [BIND_ADDRESS]="$BIND_ADDRESS"
+  [HOST_PORT]="$HOST_PORT"
+  [CONTAINER_PORT]="$CONTAINER_PORT"
   [APP_ENV]="development"
   [APP_HOSTNAME]="$DEV_HOSTNAME"
-  [APP_UPSTREAM]="127.0.0.1:80"
+  [APP_UPSTREAM]="${BIND_ADDRESS}:${CONTAINER_PORT}"
 )
 declare -A ENV_SEEN=()
 : > "$ENV_FILE"
@@ -205,101 +239,69 @@ for key in "${!ENV_VALUES[@]}"; do
 done
 chmod 600 "$ENV_FILE"
 
+info "Baking project values into the Docker Compose files"
+# Matches must be unique template lines; bake fails loudly if the template
+# drifts. Deployments keep working without .env for these values.
+BASE_COMPOSE="${TARGET_DIR}/docker-compose.yml"
+DEV_COMPOSE="${TARGET_DIR}/docker-compose.dev.yml"
+PROD_COMPOSE="${TARGET_DIR}/docker-compose.prod.yml"
+PORT_MAPPING="\"${BIND_ADDRESS}:${HOST_PORT}:${CONTAINER_PORT}\""
+
+bake "$BASE_COMPOSE" 'image: "${REGISTRY' \
+  "    image: ${REGISTRY}/${HARBOR_PROJECT}/${PROJECT_NAME}:${IMAGE_TAG}"
+bake "$BASE_COMPOSE" 'container_name:' \
+  "    container_name: ${PROJECT_NAME}"
+bake "$BASE_COMPOSE" '"${BIND_ADDRESS' \
+  "      - ${PORT_MAPPING}"
+bake "$BASE_COMPOSE" 'caddy: http://' \
+  "      caddy: http://${DEV_HOSTNAME}"
+bake "$BASE_COMPOSE" 'caddy.reverse_proxy:' \
+  "      caddy.reverse_proxy: \"{{upstreams ${CONTAINER_PORT}}}\""
+bake "$DEV_COMPOSE" 'APP_ENV:' "      APP_ENV: development"
+bake "$DEV_COMPOSE" '"${BIND_ADDRESS' "      - ${PORT_MAPPING}"
+bake "$PROD_COMPOSE" 'APP_ENV:' "      APP_ENV: production"
+
+if command -v docker >/dev/null 2>&1; then
+  info "Validating Docker Compose files with docker compose"
+  (cd "$TARGET_DIR" && docker compose config --quiet) ||
+    die "docker compose rejected the generated docker-compose.yml."
+  (cd "$TARGET_DIR" && docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet) ||
+    die "docker compose rejected the generated docker-compose.dev.yml."
+  (cd "$TARGET_DIR" && docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet) ||
+    die "docker compose rejected the generated docker-compose.prod.yml."
+fi
+
 info "Updating config/project.yaml"
-# YAML values are emitted as single-quoted scalars; embedded apostrophes double.
+# yaml_quote emits single-quoted YAML scalars; embedded apostrophes double.
 yaml_quote() {
   local value="$1"
   value="${value//\'/\'\'}"
   printf "'%s'" "$value"
 }
-export YAML_PROJECT_NAME="$(yaml_quote "$PROJECT_NAME")"
-export YAML_PROJECT_DESCRIPTION="$(yaml_quote "$DESCRIPTION")"
-export YAML_ORG="$(yaml_quote "$ORG")"
-export YAML_REGISTRY="$(yaml_quote "reg.internal.facuynati.website")"
-export YAML_HARBOR_PROJECT="$(yaml_quote "applications")"
-export YAML_IMAGE="$(yaml_quote "$PROJECT_NAME")"
-export YAML_CONTAINER_PORT="80"
-export YAML_DEV_HOSTNAME="$(yaml_quote "$DEV_HOSTNAME")"
-export YAML_PROD_HOSTNAME="$(yaml_quote "$PROD_HOSTNAME")"
-export YAML_DEV_TARGET="$(yaml_quote "$DEV_TARGET")"
-export YAML_PROD_TARGET="$(yaml_quote "$PROD_TARGET")"
-
-YAML_TMP="${YAML_FILE}.tmp"
-awk '
-{
-  if ($0 ~ /^[A-Za-z0-9_-]+:[[:space:]]*$/) {
-    top = $0
-    sub(/:.*/, "", top)
-    subkey = ""
-  } else if (top == "deployment" && $0 ~ /^  (dev|prod):[[:space:]]*$/) {
-    subkey = $0
-    sub(/^[[:space:]]*/, "", subkey)
-    sub(/:.*/, "", subkey)
-  }
-
-  if (top == "project" && $0 ~ /^  name:[[:space:]]*/) {
-    print "  name: " ENVIRON["YAML_PROJECT_NAME"]; found["project.name"]=1; next
-  }
-  if (top == "project" && $0 ~ /^  description:[[:space:]]*/) {
-    print "  description: " ENVIRON["YAML_PROJECT_DESCRIPTION"]; found["project.description"]=1; next
-  }
-  if (top == "project" && $0 ~ /^  repository:[[:space:]]*/) {
-    print "  repository: " ENVIRON["YAML_PROJECT_NAME"]; found["project.repository"]=1; next
-  }
-  if (top == "project" && $0 ~ /^  organization:[[:space:]]*/) {
-    print "  organization: " ENVIRON["YAML_ORG"]; found["project.organization"]=1; next
-  }
-  if (top == "container" && $0 ~ /^  registry:[[:space:]]*/) {
-    print "  registry: " ENVIRON["YAML_REGISTRY"]; found["container.registry"]=1; next
-  }
-  if (top == "container" && $0 ~ /^  harbor_project:[[:space:]]*/) {
-    print "  harbor_project: " ENVIRON["YAML_HARBOR_PROJECT"]; found["container.harbor_project"]=1; next
-  }
-  if (top == "container" && $0 ~ /^  image:[[:space:]]*/) {
-    print "  image: " ENVIRON["YAML_IMAGE"]; found["container.image"]=1; next
-  }
-  if (top == "container" && $0 ~ /^  port:[[:space:]]*/) {
-    print "  port: " ENVIRON["YAML_CONTAINER_PORT"]; found["container.port"]=1; next
-  }
-  if (top == "deployment" && subkey == "dev" && $0 ~ /^    hostname:[[:space:]]*/) {
-    print "    hostname: " ENVIRON["YAML_DEV_HOSTNAME"]; found["deployment.dev.hostname"]=1; next
-  }
-  if (top == "deployment" && subkey == "dev" && $0 ~ /^    target:[[:space:]]*/) {
-    print "    target: " ENVIRON["YAML_DEV_TARGET"]; found["deployment.dev.target"]=1; next
-  }
-  if (top == "deployment" && subkey == "prod" && $0 ~ /^    hostname:[[:space:]]*/) {
-    print "    hostname: " ENVIRON["YAML_PROD_HOSTNAME"]; found["deployment.prod.hostname"]=1; next
-  }
-  if (top == "deployment" && subkey == "prod" && $0 ~ /^    target:[[:space:]]*/) {
-    print "    target: " ENVIRON["YAML_PROD_TARGET"]; found["deployment.prod.target"]=1; next
-  }
-  print
-}
-END {
-  required[1]="project.name"
-  required[2]="project.description"
-  required[3]="project.repository"
-  required[4]="project.organization"
-  required[5]="container.registry"
-  required[6]="container.harbor_project"
-  required[7]="container.image"
-  required[8]="container.port"
-  required[9]="deployment.dev.hostname"
-  required[10]="deployment.dev.target"
-  required[11]="deployment.prod.hostname"
-  required[12]="deployment.prod.target"
-  for (i=1; i<=12; i++) {
-    if (!found[required[i]]) {
-      print "Missing expected YAML key: " required[i] > "/dev/stderr"
-      failed=1
-    }
-  }
-  if (failed) exit 2
-}' "$YAML_FILE" > "$YAML_TMP" || {
-  rm -f "$YAML_TMP"
-  die "Could not update config/project.yaml; its structure differs from the expected template."
-}
-mv "$YAML_TMP" "$YAML_FILE"
+bake "$YAML_FILE" "name: 'template'" \
+  "  name: $(yaml_quote "$PROJECT_NAME")"
+bake "$YAML_FILE" "description: 'repo template'" \
+  "  description: $(yaml_quote "$DESCRIPTION")"
+bake "$YAML_FILE" "repository: 'repo-template'" \
+  "  repository: $(yaml_quote "$PROJECT_NAME")"
+bake "$YAML_FILE" "organization: 'Facu-HomeLab'" \
+  "  organization: $(yaml_quote "$ORG")"
+bake "$YAML_FILE" "registry: '$REGISTRY'" \
+  "  registry: $(yaml_quote "$REGISTRY")"
+bake "$YAML_FILE" "harbor_project: '$HARBOR_PROJECT'" \
+  "  harbor_project: $(yaml_quote "$HARBOR_PROJECT")"
+bake "$YAML_FILE" "image: 'template'" \
+  "  image: $(yaml_quote "$PROJECT_NAME")"
+bake "$YAML_FILE" "port: 3000" \
+  "  port: ${CONTAINER_PORT}"
+bake "$YAML_FILE" "hostname: 'template.dev.facuynati.online'" \
+  "    hostname: $(yaml_quote "$DEV_HOSTNAME")"
+bake "$YAML_FILE" "hostname: 'template.facuynati.online'" \
+  "    hostname: $(yaml_quote "$PROD_HOSTNAME")"
+bake "$YAML_FILE" "target: 'proxmox-dev'" \
+  "    target: $(yaml_quote "$DEV_TARGET")"
+bake "$YAML_FILE" "target: 'proxmox-prod'" \
+  "    target: $(yaml_quote "$PROD_TARGET")"
 
 git -C "$TARGET_DIR" check-ignore -q .env ||
   die ".env is not ignored by .gitignore; refusing to commit it."
@@ -325,4 +327,4 @@ printf 'Repository: https://github.com/%s\n' "$REPO_FULL_NAME"
 printf 'Local path: %s\n' "$TARGET_DIR"
 printf 'Generated:  %s/.env\n' "$TARGET_DIR"
 printf 'Generated:  %s/config/project.yaml\n' "$TARGET_DIR"
-printf 'Docker Compose and Dockerfile were not modified.\n'
+printf 'Filled:     %s/docker-compose.yml (+ .dev.yml, .prod.yml)\n' "$TARGET_DIR"

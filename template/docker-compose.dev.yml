@@ -2,14 +2,13 @@
 # Docker Compose - Development Overrides
 #
 # Usage:
-# docker compose \
-#   -f deploy/docker-compose.yml \
-#   -f deploy/docker-compose.dev.yml \
-#   up -d
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 # ============================================================
 include:
   - path: docker-compose.yml
 services:
   app:
     environment:
-      APP_ENV: development
+      APP_ENV: "${APP_ENV:-development}"
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3000}:${CONTAINER_PORT:-3000}"
