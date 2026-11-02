@@ -1,32 +1,72 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-build_push() {
-  local image="$1" version="$2" environment="$3" dockerfile="$4" context="$5" robot_name="$6" robot_secret_file="$7"
-  unset DOCKER_CONTEXT
-  log "  require_commands docker!!"
+# ---------------------------------------------------------------------------
+# Build and export Docker image
+# ---------------------------------------------------------------------------
+
+build_image() {
+  local image="$1"
+  local version="$2"
+  local envname="$3"
+  local dockerfile="$4"
+  local context="$5"
+
+  local image_tar
+  local tmp_tar
+
   require_commands docker
-  [[ -f "$dockerfile" ]] || die "Dockerfile not found: $dockerfile"
-  [[ -d "$context" ]] || die "Build context not found: $context"
-  local secret
-  secret="$(<"$robot_secret_file")"
-  printf '%s' "$secret" | docker login "${image%%/*}" -u "$robot_name" --password-stdin
-  unset secret
-  local tags=("$version" "$environment")
-  [[ "$environment" == "prod" ]] && tags+=("latest")
-  local args=( --pull -f "$dockerfile" -t "$image:$version" "$context")
-  log "  docker build $args"
-  docker build "${args[@]}"
-  local tag
-  for tag in "${tags[@]}"; do
-    [[ "$tag" == "$version" ]] || docker tag "$image:$version" "$image:$tag"
-    docker push "$image:$tag"
-  done
-  local digest
-  digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$version" 2>/dev/null || true)"
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-    printf 'published_tags=%s\nimage_digest=%s\n' "$(IFS=,; echo "${tags[*]}")" "$digest" >> "$GITHUB_OUTPUT"
-  fi
+
+  [[ -n "$image" ]] || die "Docker image name is required"
+  [[ -n "$version" ]] || die "Image version is required"
+  [[ -n "$envname" ]] || die "Environment name is required"
+
+  [[ -f "$dockerfile" ]] ||
+    die "Dockerfile does not exist: ${dockerfile}"
+
+  [[ -d "$context" ]] ||
+    die "Docker build context does not exist: ${context}"
+
+  [[ -n "${RUNNER_TEMP:-}" && -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] ||
+    die "RUNNER_TEMP is unavailable or not writable"
+
+  [[ -n "${GITHUB_SHA:-}" ]] ||
+    die "GITHUB_SHA is required to label the image"
+
+  [[ -n "${GITHUB_REPOSITORY:-}" ]] ||
+    die "GITHUB_REPOSITORY is required to label the image"
+
+  image_tar="${RUNNER_TEMP}/image.tar"
+  tmp_tar="$(mktemp "${RUNNER_TEMP}/image.XXXXXX")"
+
+  # Remove incomplete exports if the build or save operation fails.
+  trap 'rm -f -- "${tmp_tar:-}"' RETURN
+
+  log "Building Docker image: ${image}:${version}"
+
+  docker build \
+    --pull \
+    --label "org.opencontainers.image.title=${image}" \
+    --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+    --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+    -f "$dockerfile" \
+    -t "${image}:${version}" \
+    "$context"
+
+  log "Exporting Docker image to ${image_tar}"
+
+  docker save \
+    "${image}:${version}" \
+    -o "$tmp_tar"
+
+  [[ -s "$tmp_tar" ]] ||
+    die "Docker image export is empty"
+
+  # Atomic replacement of the artifact.
+  mv -f -- "$tmp_tar" "$image_tar"
+
+  log "Docker image built and exported successfully"
 }

@@ -1,4 +1,3 @@
-
 name: Build, publish and deploy
 
 on:
@@ -9,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag to deploy (e.g. v0.1.0-dev.1)'
+        description: 'Release tag to deploy (e.g. v1.2.3-dev.1)'
         required: true
         type: string
 
@@ -17,217 +16,277 @@ permissions:
   contents: read
   id-token: write
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
 env:
-  BAO_ADDR: https://key.internal.facuynati.website
-  BAO_PATH_PREFIX: kv/data/Facu-HomeLab
-  # BAO_JWT_ROLE: github-actions
-  BAO_AUDIENCE: openbao
-
-  HARBOR_URL: https://reg.internal.facuynati.website
-  HARBOR_REGISTRY: reg.internal.facuynati.website
-
-  DOCKERFILE: Dockerfile
-  DOCKER_CONTEXT: .
-  COMPOSE_FILE: docker-compose.yml
-
-  VERIFY_HEALTH: 'true'
-  HEALTH_TIMEOUT: '120'
-
+  BAO_ADDR: ${{ vars.BAO_ADDR || secrets.BAO_ADDR || 'https://key.internal.facuynati.website' }}
+  BAO_PATH_PREFIX: ${{ vars.BAO_PATH_PREFIX || secrets.BAO_PATH_PREFIX || 'kv/data/Facu-HomeLab' }}
+  BAO_AUDIENCE: ${{ vars.BAO_AUDIENCE || secrets.BAO_AUDIENCE || 'openbao' }}
+  HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY || secrets.HARBOR_REGISTRY || 'reg.internal.facuynati.website' }}
 
 jobs:
-
-  # ==================================================
-  # Resolve release metadata and validate tag
-  # ==================================================
-  resolve:
-    name: Resolve release
+  deployment:
+    name: Build, publish and deploy release
     runs-on: [self-hosted, linux, x64, ephemeral, docker]
 
+    # A job-level environment cannot reference steps.release.outputs because
+    # the environment is resolved before any step executes. Derive it from
+    # the same release-tag convention used by the release resolver:
+    # * -dev.N => dev
+    # * -rc.N  => staging
+    # * stable => prod
+    environment: ${{ contains(inputs.release_tag || github.ref_name, '-dev.') && 'dev' || contains(inputs.release_tag || github.ref_name, '-rc.') && 'staging' || 'prod' }}
+
     outputs:
-      environment: ${{ steps.resolve.outputs.environment }}
-      branch: ${{ steps.resolve.outputs.branch }}
-      secret_dir: ${{ steps.resolve.outputs.secret_dir }}
-      version: ${{ steps.resolve.outputs.version }}
-      release_channel: ${{ steps.resolve.outputs.release_channel }}
-      repo_slug: ${{ steps.resolve.outputs.repo_slug }}
-      harbor_project: ${{ steps.resolve.outputs.harbor_project }}
-      image: ${{ steps.resolve.outputs.image }}
-      source_sha: ${{ steps.resolve.outputs.source_sha }}
-      jwt_role: ${{ steps.resolve.outputs.jwt_role }}
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      environment: ${{ steps.release.outputs.environment }}
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.release.outputs.image }}
 
     steps:
+      # Checkout the release tag, including its workflow scripts.
+      # Result: source code and scripts from the exact release.
       - name: Checkout release source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
+          path: source
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
-      - name: Resolve release and validate source branch
-        id: resolve
+      # Check that all required scripts exist before executing the pipeline.
+      # Result: fail early if the release is missing a required script.
+      - name: Verify workflow scripts
         shell: bash
-        env:
-          TAG: ${{ inputs.release_tag || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
-          HARBOR_REGISTRY: ${{ env.HARBOR_REGISTRY }}
+        working-directory: source
         run: |
           set -Eeuo pipefail
 
-          source "${GITHUB_WORKSPACE}/.github/workflows/scripts/common.sh"
+          source .github/workflows/scripts/common.sh
 
-          # Resolve the actual commit referenced by the release tag.
-          git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" \
-            >/dev/null || die "Git tag '${TAG}' does not exist."
+          require_scripts .github/workflows/scripts \
+            common.sh \
+            openbao.sh \
+            harbor.sh \
+            docker.sh \
+            ssh.sh \
+            deploy.sh \
+            cleanup.sh
 
-          SHA="$(git rev-parse "${TAG}^{commit}")"
+      # Validate the tag, resolve its commit and derive the environment.
+      # Result: tag, SHA, environment, image name and version for later steps.
+      - name: Resolve release
+        id: release
+        shell: bash
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -Eeuo pipefail
 
-          log "Requested TAG: '${TAG}'"
+          source .github/workflows/scripts/common.sh
 
-          resolve_release "$TAG" "$REPOSITORY" "$HARBOR_REGISTRY"
+          TAG="$RELEASE_TAG"
 
-          log "Validation target: branch='${BRANCH}', environment='${ENVIRONMENT}'"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+|-rc\.[0-9]+)?$ ]] ||
+            die "Invalid release tag: ${TAG}"
 
-          validate_release_branch "$BRANCH" "$SHA"
+          SHA="$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}")" ||
+            die "Tag does not exist or does not reference a valid commit: ${TAG}"
 
-          resolve_openbao_jwt_role "$BRANCH"
+          resolve_release "$TAG" "$GITHUB_REPOSITORY" "$HARBOR_REGISTRY"
 
           {
-            echo "environment=$ENVIRONMENT"
-            echo "branch=$BRANCH"
-            echo "secret_dir=$SECRET_DIR"
-            echo "version=$VERSION"
-            echo "release_channel=$RELEASE_CHANNEL"
-            echo "repo_slug=$REPO_SLUG"
-            echo "harbor_project=$HARBOR_PROJECT"
-            echo "image=$IMAGE"
-            echo "source_sha=$SHA"
+            echo "tag=${TAG}"
+            echo "sha=${SHA}"
+            echo "environment=${ENVIRONMENT}"
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
           } >> "$GITHUB_OUTPUT"
 
+          log "Release resolved: ${TAG} (${SHA}) - ${ENVIRONMENT}"
 
-  # ==================================================
-  # Build, publish and deploy
-  # ==================================================
-  deploy:
-    name: Build and deploy (${{ needs.resolve.outputs.environment }})
-    needs: resolve
-
-    runs-on: [self-hosted, linux, x64, ephemeral, docker]
-
-    environment: ${{ needs.resolve.outputs.environment }}
-
-    timeout-minutes: 30
-
-    concurrency:
-      group: deploy-${{ github.repository }}-${{ needs.resolve.outputs.environment }}
-      cancel-in-progress: false
-
-    steps:
-      - name: Checkout release source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Validate runner and initialize state
+      # Build and export the Docker image using the release metadata.
+      # Result: Docker image available locally and saved to RUNNER_TEMP/image.tar.
+      - name: Build Docker image
         shell: bash
+        working-directory: source
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.version }}
+          ENVIRONMENT: ${{ steps.release.outputs.environment }}
         run: |
           set -Eeuo pipefail
 
-          source "${GITHUB_WORKSPACE}/.github/workflows/scripts/common.sh"
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/docker.sh
 
-          require_commands curl jq git docker ssh scp ssh-keygen
-          docker compose version
+          build_image \
+            "$IMAGE" \
+            "$VERSION" \
+            "$ENVIRONMENT" \
+            "Dockerfile" \
+            "."
 
-          mkdir -p "$RUNNER_TEMP/ci-cd-state"
-          chmod 700 "$RUNNER_TEMP/ci-cd-state"
-
-      # ----------------------------------------------
-      # OpenBao
-      # ----------------------------------------------
-      - name: OpenBao login and read deployment secrets
+      # Single OpenBao fetch shared by publish, robot, SSH and deploy steps.
+      # Result: private JSON secret file; only its path is exposed as an output.
+      - name: Load OpenBao configuration
         id: bao
-        uses: ./.github/workflows/actions/openbao-login
-        with:
-          bao_addr: ${{ env.BAO_ADDR }}
-          # jwt_role: ${{ env.BAO_JWT_ROLE }}
-          jwt_role: ${{ needs.resolve.outputs.jwt_role }}
-          audience: ${{ env.BAO_AUDIENCE }}
-          secret_path: ${{ env.BAO_PATH_PREFIX }}/${{ needs.resolve.outputs.secret_dir }}
+        shell: bash
+        working-directory: source
+        env:
+          ENVIRONMENT: ${{ steps.release.outputs.environment }}
+        run: |
+          set -Eeuo pipefail
 
-      # ----------------------------------------------
-      # Harbor
-      # ----------------------------------------------
-      - name: Ensure Harbor project
-        uses: ./.github/workflows/actions/harbor-project
-        with:
-          harbor_url: ${{ env.HARBOR_URL }}
-          project: ${{ needs.resolve.outputs.harbor_project }}
-          secret_file: ${{ steps.bao.outputs.secret_file }}
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/openbao.sh
 
-      - name: Create temporary Harbor robot
+          JWT_ROLE="$(resolve_openbao_jwt_role "$ENVIRONMENT")"
+
+          openbao_load_environment_config \
+            "$ENVIRONMENT" \
+            "$BAO_ADDR" \
+            "$BAO_PATH_PREFIX" \
+            "$BAO_AUDIENCE" \
+            "$JWT_ROLE" \
+            "$GITHUB_OUTPUT"
+
+      # Load the image, authenticate with Harbor and push release tags.
+      # Result: version, environment and name tags published in Harbor.
+      - name: Publish image to Harbor
+        shell: bash
+        working-directory: source
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.version }}
+          ENVIRONMENT: ${{ steps.release.outputs.environment }}
+          SECRET_FILE: ${{ steps.bao.outputs.secret_file }}
+        run: |
+          set -Eeuo pipefail
+
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/harbor.sh
+
+          docker load --input "${RUNNER_TEMP}/image.tar"
+
+          harbor_login
+          harbor_push "$VERSION"
+
+      # Create a temporary Harbor robot with pull-only permissions.
+      - name: Create temporary Harbor pull robot
         id: robot
-        uses: ./.github/workflows/actions/harbor-robot
-        with:
-          harbor_url: ${{ env.HARBOR_URL }}
-          project: ${{ needs.resolve.outputs.harbor_project }}
-          secret_file: ${{ steps.bao.outputs.secret_file }}
+        shell: bash
+        working-directory: source
+        env:
+          SECRET_FILE: ${{ steps.bao.outputs.secret_file }}
+          HARBOR_URL: ${{ vars.HARBOR_URL || secrets.HARBOR_URL || format('https://{0}', env.HARBOR_REGISTRY) }}
+          ROBOT_SECRET_FILE: ${{ runner.temp }}/ci-cd-state/harbor-robot-secret
+          ROBOT_STATE_FILE: ${{ runner.temp }}/ci-cd-state/harbor-robot-state.json
+        run: |
+          set -Eeuo pipefail
 
-      # ----------------------------------------------
-      # Docker build and push
-      # ----------------------------------------------
-      - name: Build and push image
-        id: image
-        uses: ./.github/workflows/actions/docker-build-push
-        with:
-          image: ${{ needs.resolve.outputs.image }}
-          version: ${{ needs.resolve.outputs.version }}
-          environment: ${{ needs.resolve.outputs.environment }}
-          dockerfile: ${{ env.DOCKERFILE }}
-          context: ${{ env.DOCKER_CONTEXT }}
-          robot_name: ${{ steps.robot.outputs.robot_name }}
-          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/harbor.sh
 
-      # ----------------------------------------------
-      # SSH
-      # ----------------------------------------------
+          harbor_project "$SECRET_FILE"
+
+          mkdir -p "${RUNNER_TEMP}/ci-cd-state"
+          chmod 700 "${RUNNER_TEMP}/ci-cd-state"
+
+          create_robot \
+            "${HARBOR_URL}" \
+            "${HARBOR_PROJECT}" \
+            "${SECRET_FILE}" \
+            "gha-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            pull \
+            "${ROBOT_SECRET_FILE}" \
+            "${ROBOT_STATE_FILE}"
+
+      # Prepare SSH credentials and connection settings.
       - name: Prepare SSH
         id: ssh
-        uses: ./.github/workflows/actions/ssh-prepare
-        with:
-          secret_file: ${{ steps.bao.outputs.secret_file }}
+        shell: bash
+        working-directory: source
+        env:
+          SECRET_FILE: ${{ steps.bao.outputs.secret_file }}
+          SSH_DIR: ${{ runner.temp }}/deployment-ssh
+        run: |
+          set -Eeuo pipefail
 
-      # ----------------------------------------------
-      # Remote deployment
-      # ----------------------------------------------
-      - name: Deploy with Docker Compose
-        uses: ./.github/workflows/actions/deploy-compose
-        with:
-          secret_file: ${{ steps.bao.outputs.secret_file }}
-          ssh_dir: ${{ steps.ssh.outputs.ssh_dir }}
-          image: ${{ needs.resolve.outputs.image }}
-          version: ${{ needs.resolve.outputs.version }}
-          repo_slug: ${{ needs.resolve.outputs.repo_slug }}
-          compose_file: ${{ env.COMPOSE_FILE }}
-          verify_health: ${{ env.VERIFY_HEALTH }}
-          health_timeout: ${{ env.HEALTH_TIMEOUT }}
-          harbor_registry: ${{ env.HARBOR_REGISTRY }}
-          robot_name: ${{ steps.robot.outputs.robot_name }}
-          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
+          source .github/workflows/scripts/ssh.sh
 
-      # ----------------------------------------------
-      # Cleanup
-      # ----------------------------------------------
-      - name: Cleanup credentials and temporary resources
+          prepare_ssh "$SECRET_FILE" "$SSH_DIR"
+
+          echo "ssh_dir=${SSH_DIR}" >> "$GITHUB_OUTPUT"
+
+      # Deploy the published release to the target environment.
+      # Result: application deployed using the selected release tag.
+      - name: Deploy
+        shell: bash
+        working-directory: source
+        env:
+          SECRET_FILE: ${{ steps.bao.outputs.secret_file }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          SSH_DIR: ${{ steps.ssh.outputs.ssh_dir }}
+          ROBOT_SECRET_FILE: ${{ steps.robot.outputs.robot_secret_file }}
+          ROBOT_STATE_FILE: ${{ steps.robot.outputs.robot_state_file }}
+        run: |
+          set -Eeuo pipefail
+
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/deploy.sh
+
+          deploy_release
+
+      # Execute runner cleanup even if an earlier step failed.
+      - name: Cleanup
         if: always()
-        uses: ./.github/workflows/actions/cleanup
-        with:
-          bao_addr: ${{ env.BAO_ADDR }}
-          harbor_url: ${{ env.HARBOR_URL }}
-          secret_file: ${{ steps.bao.outputs.secret_file }}
-          robot_state_file: ${{ steps.robot.outputs.robot_state_file }}
-          robot_secret_file: ${{ steps.robot.outputs.robot_secret_file }}
-          ssh_dir: ${{ steps.ssh.outputs.ssh_dir }}
-          harbor_registry: ${{ env.HARBOR_REGISTRY }}
+        shell: bash
+        working-directory: source
+        env:
+          HARBOR_URL: ${{ vars.HARBOR_URL || secrets.HARBOR_URL || format('https://{0}', env.HARBOR_REGISTRY) }}
+          SECRET_FILE: ${{ steps.bao.outputs.secret_file }}
+          ROBOT_STATE_FILE: ${{ runner.temp }}/ci-cd-state/harbor-robot-state.json
+          SSH_DIR: ${{ runner.temp }}/deployment-ssh
+        run: |
+          set -Eeuo pipefail
+
+          source .github/workflows/scripts/common.sh
+          source .github/workflows/scripts/cleanup.sh
+
+          # Delete the temporary Harbor robot if it was created.
+          # Run in a subshell so a deletion failure does not prevent
+          # local credential and artifact cleanup.
+          if [[ -s "${ROBOT_STATE_FILE}" ]]; then
+            if [[ -n "${SECRET_FILE:-}" && -r "${SECRET_FILE}" ]]; then
+              if ! (
+                source .github/workflows/scripts/harbor.sh
+                delete_robot \
+                  "${HARBOR_URL}" \
+                  "${SECRET_FILE}" \
+                  "${ROBOT_STATE_FILE}"
+              ); then
+                echo "::warning::Unable to delete the temporary Harbor robot. Manual cleanup may be required."
+              fi
+            else
+              echo "::warning::Harbor robot state exists, but administrative credentials are unavailable. Manual cleanup may be required."
+            fi
+          else
+            log "No temporary Harbor robot to delete"
+          fi
+
+          # Remove temporary SSH configuration and log out of Harbor.
+          cleanup_runner \
+            "${HARBOR_REGISTRY:-}" \
+            "${SSH_DIR}"
+
+          # Remove temporary robot credentials and metadata.
+          rm -f -- \
+            "${RUNNER_TEMP}/ci-cd-state/harbor-robot-secret" \
+            "${ROBOT_STATE_FILE}"
+
+          # Remove the exported Docker image.
+          rm -f -- "${RUNNER_TEMP}/image.tar"
+
+          log "Temporary credentials and build artifact cleanup completed"

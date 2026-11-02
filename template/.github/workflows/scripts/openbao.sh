@@ -1,261 +1,320 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=common.sh
-source "$SCRIPT_DIR/common.sh"
+source "${SCRIPT_DIR}/common.sh"
 
-bao_request() {
-  local operation="$1"
-  local url="$2"
-  shift 2
+# ---------------------------------------------------------------------------
+# OpenBao authentication and secret retrieval
+# ---------------------------------------------------------------------------
 
-  local body_file error_file status
-  body_file="$(mktemp)"
-  error_file="$(mktemp)"
-
-  if ! status="$(curl --silent --show-error \
-      --output "$body_file" \
-      --write-out '%{http_code}' \
-      "$@" "$url" 2>"$error_file")"; then
-    log "ERROR: OpenBao request failed during: $operation"
-    cat "$error_file" >&2
-    rm -f "$body_file" "$error_file"
-    die "Network or TLS error during $operation"
-  fi
-
-  if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-    log "ERROR: OpenBao returned HTTP $status during: $operation"
-
-    local api_error
-    api_error="$(jq -r '.errors // empty | if type == "array" then join("; ") else tostring end' \
-      "$body_file" 2>/dev/null || true)"
-
-    [[ -n "$api_error" ]] && log "OpenBao message: $api_error"
-
-    rm -f "$body_file" "$error_file"
-    die "OpenBao request failed: $operation (HTTP $status)"
-  fi
-
-  RESPONSE_BODY="$(cat "$body_file")"
-  rm -f "$body_file" "$error_file"
-}
-
-
-bao_login_and_read() {
+bao_read() {
   local addr="$1"
   local role="$2"
   local audience="$3"
   local path="$4"
+  local out="$5"
+
+  local jwt=""
+  local token=""
+  local status=""
+  local body=""
+  local secret_path=""
+
+  # Validate arguments.
+  [[ -n "$addr" ]] ||
+    die "OpenBao address is required"
+
+  [[ "$addr" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/.*)?$ ]] ||
+    die "BAO_ADDR must be a valid HTTPS URL"
+
+  [[ -n "$role" ]] ||
+    die "OpenBao JWT role is required"
+
+  [[ -n "$audience" ]] ||
+    die "OpenBao JWT audience is required"
+
+  [[ -n "$path" ]] ||
+    die "OpenBao secret path is required"
+
+  [[ -n "$out" ]] ||
+    die "Output file is required"
+
+  [[ -d "$(dirname -- "$out")" ]] ||
+    die "Output directory does not exist"
 
   require_commands curl jq
 
+  # Validate GitHub Actions OIDC environment.
   [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" &&
-     -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] \
-    || die "GitHub OIDC request environment is unavailable"
+     -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] ||
+    die "GitHub OIDC is not available in this job"
 
-  local jwt token secret_file
-  local login_response read_response
-  local token_accessor
-  local body_file error_file status api_error
+  # Prepare private temporary response file.
+  umask 077
+  body="$(mktemp)"
 
-  # --------------------------------------------------
-  # 1. GitHub Actions OIDC token
-  # --------------------------------------------------
+  # Ensure temporary data is removed and OpenBao token revoked
+  # if the function exits unexpectedly.
+  trap '
+    if [[ -n "${token:-}" ]]; then
+      curl --silent --show-error --fail \
+        -X POST \
+        -H "X-Vault-Token: ${token}" \
+        -H "Content-Type: application/json" \
+        --data "{}" \
+        "${addr%/}/v1/auth/token/revoke-self" >/dev/null ||
+        warn "OpenBao token revocation failed; TTL remains the fallback"
+    fi
 
-  log "Requesting GitHub Actions OIDC token..."
+    unset token jwt
+    [[ -n "${body:-}" ]] && rm -f -- "$body"
+  ' EXIT
 
-  body_file="$(mktemp)"
-  error_file="$(mktemp)"
+  # -------------------------------------------------------------------------
+  # 1. Request GitHub OIDC token
+  # -------------------------------------------------------------------------
 
-  if ! status="$(curl --silent --show-error \
-      --output "$body_file" \
+  log "Requesting short-lived GitHub OIDC token"
+
+  status="$(
+    curl \
+      --silent \
+      --show-error \
+      --output "$body" \
       --write-out '%{http_code}' \
       -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(jq -rn --arg v "$audience" '$v|@uri')" \
-      2>"$error_file")"; then
+      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(jq -rn --arg value "$audience" '$value | @uri')"
+  )" || die "GitHub OIDC endpoint request failed"
 
-    log "ERROR: GitHub OIDC request failed"
-    cat "$error_file" >&2
-    rm -f "$body_file" "$error_file"
-    die "Could not obtain GitHub Actions OIDC token"
-  fi
+  [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+    die "GitHub OIDC returned HTTP ${status}"
 
-  if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-    log "ERROR: GitHub OIDC returned HTTP $status"
+  jwt="$(jq -er '.value | strings | select(length > 0)' "$body")" ||
+    die "Unable to extract GitHub OIDC token"
 
-    api_error="$(jq -r '.message // .error // empty' \
-      "$body_file" 2>/dev/null || true)"
+  # Clear the response containing the JWT.
+  : > "$body"
 
-    [[ -n "$api_error" ]] && log "Response: $api_error"
+  # -------------------------------------------------------------------------
+  # 2. Authenticate to OpenBao using JWT
+  # -------------------------------------------------------------------------
 
-    rm -f "$body_file" "$error_file"
-    die "GitHub OIDC token request failed (HTTP $status)"
-  fi
+  log "Authenticating to OpenBao using role '${role}'"
 
-  jwt="$(jq -er '.value' "$body_file")"
-  rm -f "$body_file" "$error_file"
-
-  [[ -n "$jwt" ]] || die "GitHub OIDC returned an empty JWT"
-
-  # --------------------------------------------------
-  # 2. OpenBao JWT authentication
-  # --------------------------------------------------
-
-  log "Authenticating with OpenBao JWT role '${role}'..."
-
-  body_file="$(mktemp)"
-  error_file="$(mktemp)"
-
-  if ! status="$(curl --silent --show-error \
-      --output "$body_file" \
+  status="$(
+    curl \
+      --silent \
+      --show-error \
+      --output "$body" \
       --write-out '%{http_code}' \
-      -H 'Content-Type: application/json' \
-      --data "$(jq -n \
-        --arg role "$role" \
-        --arg jwt "$jwt" \
-        '{role:$role,jwt:$jwt}')" \
-      "${addr%/}/v1/auth/jwt/login" \
-      2>"$error_file")"; then
+      -H "Content-Type: application/json" \
+      --data "$(jq -n --arg role "$role" --arg jwt "$jwt" \
+        '{role: $role, jwt: $jwt}')" \
+      "${addr%/}/v1/auth/jwt/login"
+  )" || die "OpenBao login request failed"
 
-    log "ERROR: OpenBao JWT authentication request failed"
-    cat "$error_file" >&2
-    rm -f "$body_file" "$error_file"
-    unset jwt
-    die "Could not authenticate with OpenBao"
-  fi
+  unset jwt
 
-  if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-    log "ERROR: OpenBao JWT login returned HTTP $status"
+  [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+    die "OpenBao login returned HTTP ${status}"
 
-    api_error="$(jq -r '.errors // empty |
-      if type == "array" then join("; ") else tostring end' \
-      "$body_file" 2>/dev/null || true)"
+  token="$(jq -er '.auth.client_token | strings | select(length > 0)' "$body")" ||
+    die "Unable to extract OpenBao client token"
 
-    [[ -n "$api_error" ]] && log "OpenBao message: $api_error"
+  # Clear the response containing authentication data.
+  : > "$body"
 
-    rm -f "$body_file" "$error_file"
-    unset jwt
-    die "OpenBao JWT authentication failed (HTTP $status)"
-  fi
+  # -------------------------------------------------------------------------
+  # 3. Read environment secrets from OpenBao KV v2
+  # -------------------------------------------------------------------------
 
-  login_response="$(cat "$body_file")"
-  rm -f "$body_file" "$error_file"
+  secret_path="$(trim_slashes "$path")"
 
-  token="$(jq -er '.auth.client_token' <<<"$login_response")"
-  token_accessor="$(jq -er '.auth.accessor // empty' <<<"$login_response")"
+  [[ -n "$secret_path" ]] ||
+    die "Invalid OpenBao secret path"
 
-  [[ -n "$token" ]] || die "OpenBao login did not return a client token"
+  log "Reading OpenBao KV path '${secret_path}'"
 
-  unset jwt login_response
-
-  # --------------------------------------------------
-  # 3. Read KV v2 secret
-  # --------------------------------------------------
-
-  log "Reading OpenBao secret: ${path}"
-
-  body_file="$(mktemp)"
-  error_file="$(mktemp)"
-
-  if ! status="$(curl --silent --show-error \
-      --output "$body_file" \
+  status="$(
+    curl \
+      --silent \
+      --show-error \
+      --output "$body" \
       --write-out '%{http_code}' \
-      -H "X-Vault-Token: $token" \
-      "${addr%/}/v1/$(trim_slashes "$path")" \
-      2>"$error_file")"; then
+      -H "X-Vault-Token: ${token}" \
+      "${addr%/}/v1/${secret_path}"
+  )" || die "OpenBao KV request failed"
 
-    log "ERROR: OpenBao KV request failed"
-    cat "$error_file" >&2
-    rm -f "$body_file" "$error_file"
-    unset token
-    die "Could not read OpenBao secret"
-  fi
+  [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
+    die "OpenBao KV read returned HTTP ${status}"
 
-  if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-    log "ERROR: OpenBao KV read returned HTTP $status"
+  # Validate expected KV v2 response structure.
+  jq -e '.data.data | type == "object"' "$body" >/dev/null ||
+    die "Unexpected OpenBao KV v2 response"
 
-    api_error="$(jq -r '.errors // empty |
-      if type == "array" then join("; ") else tostring end' \
-      "$body_file" 2>/dev/null || true)"
+  # -------------------------------------------------------------------------
+  # 4. Write secrets to protected JSON file
+  # -------------------------------------------------------------------------
 
-    [[ -n "$api_error" ]] && log "OpenBao message: $api_error"
+  jq '.data.data' "$body" > "$out" ||
+    die "Unable to write OpenBao secrets to output file"
 
-    rm -f "$body_file" "$error_file"
-    unset token
-    die "OpenBao KV read failed (HTTP $status)"
-  fi
+  chmod 600 "$out"
 
-  read_response="$(cat "$body_file")"
-  rm -f "$body_file" "$error_file"
+  # Clear response data from temporary file.
+  : > "$body"
 
-  jq -e '.data.data | type == "object"' \
-    >/dev/null <<<"$read_response" \
-    || {
-      unset token
-      die "OpenBao KV v2 response did not contain data.data"
-    }
+  # -------------------------------------------------------------------------
+  # 5. Revoke short-lived OpenBao token
+  # -------------------------------------------------------------------------
 
-  # --------------------------------------------------
-  # 4. Save secrets to temporary JSON file
-  # --------------------------------------------------
+  log "Revoking short-lived OpenBao token"
 
-  secret_file="${RUNNER_TEMP:-/tmp}/openbao-secrets-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}.json"
+  curl \
+    --silent \
+    --show-error \
+    --fail \
+    -X POST \
+    -H "X-Vault-Token: ${token}" \
+    -H "Content-Type: application/json" \
+    --data '{}' \
+    "${addr%/}/v1/auth/token/revoke-self" >/dev/null ||
+    warn "OpenBao token revocation failed; TTL remains the fallback"
 
-  umask 077
+  unset token
 
-  jq '.data.data' <<<"$read_response" > "$secret_file"
-  chmod 600 "$secret_file"
+  # Remove temporary response file and trap.
+  rm -f -- "$body"
+  body=""
+  trap - EXIT
 
-  unset read_response
+  log "OpenBao secrets successfully written to protected file"
 
-  # --------------------------------------------------
-  # 5. Validate required secrets
-  # --------------------------------------------------
-
-  local required
-
-  for required in \
-    HARBOR_ADMIN_USERNAME \
-    HARBOR_ADMIN_PASSWORD \
-    DEPLOY_SSH_KEY \
-    DEPLOY_KNOWN_HOSTS \
-    DEPLOY_HOST \
-    DEPLOY_USER \
-    DEPLOY_PATH
-  do
-    json_secret "$secret_file" "$required" >/dev/null \
-      || {
-        unset token
-        die "Missing required OpenBao key: $required"
-      }
-  done
-
-  # --------------------------------------------------
-  # 6. Revoke OpenBao token
-  # --------------------------------------------------
-
-  log "Revoking temporary OpenBao token..."
-
-  if ! curl --fail --silent --show-error \
-      -X POST \
-      -H "X-Vault-Token: $token" \
-      -H 'Content-Type: application/json' \
-      --data '{}' \
-      "${addr%/}/v1/auth/token/revoke-self" \
-      >/dev/null; then
-
-    warn "Could not revoke OpenBao token; its configured TTL remains the fallback"
-  fi
-
-  unset token token_accessor
-
-  log "OpenBao authentication and secret retrieval completed successfully."
-
-  printf '%s\n' "$secret_file"
+  printf '%s\n' "$out"
 }
 
+# ---------------------------------------------------------------------------
+# Standalone execution
+# ---------------------------------------------------------------------------
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  [[ $# -eq 4 ]] || die "Usage: openbao.sh <bao_addr> <jwt_role> <audience> <secret_path>"
-  bao_login_and_read "$1" "$2" "$3" "$4"
+  [[ $# == 5 ]] ||
+    die "Usage: openbao.sh <addr> <role> <audience> <path> <output-file>"
+
+  bao_read "$@"
 fi
+
+# ---------------------------------------------------------------------------
+# Environment configuration loader
+# ---------------------------------------------------------------------------
+
+openbao_load_environment_config() {
+  local environment="$1"
+  local bao_addr="$2"
+  local bao_path_prefix="$3"
+  local bao_audience="$4"
+  local jwt_role="$5"
+  local github_output="$6"
+
+  local secret_dir=""
+  local secret_path=""
+  local state_dir=""
+  local secret_file=""
+
+  # -------------------------------------------------------------------------
+  # 1. Validate required arguments
+  # -------------------------------------------------------------------------
+
+  [[ -n "$environment" ]] ||
+    die "Environment is required"
+
+  [[ -n "$bao_addr" ]] ||
+    die "BAO_ADDR is required"
+
+  [[ -n "$bao_path_prefix" ]] ||
+    die "BAO_PATH_PREFIX is required"
+
+  [[ -n "$bao_audience" ]] ||
+    die "BAO_AUDIENCE is required"
+
+  [[ -n "$jwt_role" ]] ||
+    die "OpenBao JWT role is required"
+
+  [[ -n "$github_output" ]] ||
+    die "GITHUB_OUTPUT path is required"
+
+  [[ -n "${RUNNER_TEMP:-}" ]] ||
+    die "RUNNER_TEMP is not set"
+
+  [[ -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] ||
+    die "RUNNER_TEMP is not writable"
+
+  [[ -f "$github_output" && -w "$github_output" ]] ||
+    die "GITHUB_OUTPUT is unavailable or not writable"
+
+  # -------------------------------------------------------------------------
+  # 2. Resolve environment-specific OpenBao secret directory
+  # -------------------------------------------------------------------------
+
+  case "$environment" in
+    dev)
+      secret_dir="Dev"
+      ;;
+    staging)
+      secret_dir="Staging"
+      ;;
+    prod)
+      secret_dir="Prod"
+      ;;
+    *)
+      die "Unsupported environment: ${environment}"
+      ;;
+  esac
+
+  secret_path="${bao_path_prefix%/}/${secret_dir}"
+
+  # -------------------------------------------------------------------------
+  # 3. Create protected temporary state directory
+  # -------------------------------------------------------------------------
+
+  state_dir="${RUNNER_TEMP}/ci-cd-state"
+
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+
+  # Create a unique secret file.
+  umask 077
+
+  secret_file="$(mktemp "${state_dir}/openbao.XXXXXX.json")"
+  chmod 600 "$secret_file"
+
+  # -------------------------------------------------------------------------
+  # 4. Authenticate and retrieve environment secrets
+  # -------------------------------------------------------------------------
+
+  log "Loading OpenBao configuration for environment '${environment}'"
+
+  if ! bao_read \
+    "$bao_addr" \
+    "$jwt_role" \
+    "$bao_audience" \
+    "$secret_path" \
+    "$secret_file" >/dev/null; then
+
+    rm -f -- "$secret_file"
+    die "Failed to load OpenBao configuration"
+  fi
+
+  # -------------------------------------------------------------------------
+  # 5. Export only the secret file path to GitHub Actions
+  # -------------------------------------------------------------------------
+
+  printf 'secret_file=%s\n' "$secret_file" >> "$github_output" ||
+    {
+      rm -f -- "$secret_file"
+      die "Unable to write secret_file output to GITHUB_OUTPUT"
+    }
+
+  log "OpenBao configuration loaded for environment '${environment}'"
+}
