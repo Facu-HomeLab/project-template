@@ -101,7 +101,13 @@ PROD_HOSTNAME=""
 DEV_TARGET=""
 PROD_TARGET=""
 CLI_MODE=false
-declare -A SEEN=()
+# Track seen CLI options without associative arrays (Bash 3.2 compatible)
+SEEN_NAME=0
+SEEN_DESCRIPTION=0
+SEEN_DEV_HOSTNAME=0
+SEEN_PROD_HOSTNAME=0
+SEEN_DEV_TARGET=0
+SEEN_PROD_TARGET=0
 
 while (($#)); do
   case "$1" in
@@ -109,14 +115,13 @@ while (($#)); do
       (($# >= 2)) || die "$1 requires a value"
       key="$1"; value="$2"
       case "$key" in
-        --name) PROJECT_NAME="$value" ;;
-        --description) DESCRIPTION="$value" ;;
-        --dev-hostname) DEV_HOSTNAME="$value" ;;
-        --prod-hostname) PROD_HOSTNAME="$value" ;;
-        --dev-target) DEV_TARGET="$value" ;;
-        --prod-target) PROD_TARGET="$value" ;;
+        --name) PROJECT_NAME="$value"; SEEN_NAME=1 ;;
+        --description) DESCRIPTION="$value"; SEEN_DESCRIPTION=1 ;;
+        --dev-hostname) DEV_HOSTNAME="$value"; SEEN_DEV_HOSTNAME=1 ;;
+        --prod-hostname) PROD_HOSTNAME="$value"; SEEN_PROD_HOSTNAME=1 ;;
+        --dev-target) DEV_TARGET="$value"; SEEN_DEV_TARGET=1 ;;
+        --prod-target) PROD_TARGET="$value"; SEEN_PROD_TARGET=1 ;;
       esac
-      SEEN["$key"]=1
       CLI_MODE=true
       shift 2
       ;;
@@ -140,9 +145,12 @@ if [[ "$CLI_MODE" == false ]]; then
   prompt_value DEV_TARGET "Development deployment target" "proxmox-dev"
   prompt_value PROD_TARGET "Production deployment target" "proxmox-prod"
 else
-  for option in --name --description --dev-hostname --prod-hostname --dev-target --prod-target; do
-    [[ -n "${SEEN[$option]:-}" ]] || die "CLI mode requires $option."
-  done
+  [[ $SEEN_NAME -eq 1 ]] || die "CLI mode requires --name."
+  [[ $SEEN_DESCRIPTION -eq 1 ]] || die "CLI mode requires --description."
+  [[ $SEEN_DEV_HOSTNAME -eq 1 ]] || die "CLI mode requires --dev-hostname."
+  [[ $SEEN_PROD_HOSTNAME -eq 1 ]] || die "CLI mode requires --prod-hostname."
+  [[ $SEEN_DEV_TARGET -eq 1 ]] || die "CLI mode requires --dev-target."
+  [[ $SEEN_PROD_TARGET -eq 1 ]] || die "CLI mode requires --prod-target."
 fi
 
 validate_project_name "$PROJECT_NAME"
@@ -204,27 +212,51 @@ done
 info "Generating .env from .env.example"
 # Bash reads .env.example line by line, replacing known variables and preserving
 # comments, blank lines, ordering, and variables added by future template versions.
-declare -A ENV_VALUES=(
-  [REGISTRY]="$REGISTRY"
-  [HARBOR_PROJECT]="$HARBOR_PROJECT"
-  [IMAGE_NAME]="$PROJECT_NAME"
-  [IMAGE_TAG]="$IMAGE_TAG"
-  [CONTAINER_NAME]="$PROJECT_NAME"
-  [BIND_ADDRESS]="$BIND_ADDRESS"
-  [HOST_PORT]="$HOST_PORT"
-  [CONTAINER_PORT]="$CONTAINER_PORT"
-  [APP_ENV]="development"
-  [APP_HOSTNAME]="$DEV_HOSTNAME"
-  [APP_UPSTREAM]="${BIND_ADDRESS}:${CONTAINER_PORT}"
+# Parallel arrays (Bash 3.2 compatible)
+ENV_KEYS=(
+  REGISTRY
+  HARBOR_PROJECT
+  IMAGE_NAME
+  IMAGE_TAG
+  CONTAINER_NAME
+  BIND_ADDRESS
+  HOST_PORT
+  CONTAINER_PORT
+  APP_ENV
+  APP_HOSTNAME
+  APP_UPSTREAM
 )
-declare -A ENV_SEEN=()
+ENV_VALS=(
+  "$REGISTRY"
+  "$HARBOR_PROJECT"
+  "$PROJECT_NAME"
+  "$IMAGE_TAG"
+  "$PROJECT_NAME"
+  "$BIND_ADDRESS"
+  "$HOST_PORT"
+  "$CONTAINER_PORT"
+  "development"
+  "$DEV_HOSTNAME"
+  "${BIND_ADDRESS}:${CONTAINER_PORT}"
+)
+# Track seen keys with parallel array
+ENV_SEEN=()
+for _ in "${ENV_KEYS[@]}"; do ENV_SEEN+=("0"); done
 : > "$ENV_FILE"
 while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
     key="${BASH_REMATCH[1]}"
-    if [[ -v "ENV_VALUES[$key]" ]]; then
-      printf '%s=%s\n' "$key" "${ENV_VALUES[$key]}" >> "$ENV_FILE"
-      ENV_SEEN["$key"]=1
+    # Linear search in parallel arrays (Bash 3.2 compatible)
+    found_idx=-1
+    for i in "${!ENV_KEYS[@]}"; do
+      if [[ "${ENV_KEYS[i]}" == "$key" ]]; then
+        found_idx=$i
+        break
+      fi
+    done
+    if [[ $found_idx -ge 0 ]]; then
+      printf '%s=%s\n' "$key" "${ENV_VALS[found_idx]}" >> "$ENV_FILE"
+      ENV_SEEN[found_idx]=1
     else
       printf '%s\n' "$line" >> "$ENV_FILE"
     fi
@@ -233,9 +265,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   fi
 done < "$ENV_EXAMPLE"
 
-for key in "${!ENV_VALUES[@]}"; do
-  [[ -n "${ENV_SEEN[$key]:-}" ]] ||
-    die "Template .env.example is missing expected key: $key"
+for i in "${!ENV_KEYS[@]}"; do
+  [[ ${ENV_SEEN[i]} -eq 1 ]] ||
+    die "Template .env.example is missing expected key: ${ENV_KEYS[i]}"
 done
 chmod 600 "$ENV_FILE"
 
@@ -272,35 +304,35 @@ if command -v docker >/dev/null 2>&1; then
 fi
 
 info "Updating config/project.yaml"
-# yaml_quote emits single-quoted YAML scalars; embedded apostrophes double.
+# yaml_quote emits double-quoted YAML scalars; embedded quotes escaped.
 yaml_quote() {
   local value="$1"
-  value="${value//\'/\'\'}"
-  printf "'%s'" "$value"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
 }
-bake "$YAML_FILE" "name: 'template'" \
+bake "$YAML_FILE" 'name: "template"' \
   "  name: $(yaml_quote "$PROJECT_NAME")"
-bake "$YAML_FILE" "description: 'repo template'" \
+bake "$YAML_FILE" 'description: "repo template"' \
   "  description: $(yaml_quote "$DESCRIPTION")"
-bake "$YAML_FILE" "repository: 'repo-template'" \
+bake "$YAML_FILE" 'repository: "repo-template"' \
   "  repository: $(yaml_quote "$PROJECT_NAME")"
-bake "$YAML_FILE" "organization: 'Facu-HomeLab'" \
+bake "$YAML_FILE" 'organization: "Facu-HomeLab"' \
   "  organization: $(yaml_quote "$ORG")"
-bake "$YAML_FILE" "registry: '$REGISTRY'" \
+bake "$YAML_FILE" 'registry: "reg.internal.facuynati.website"' \
   "  registry: $(yaml_quote "$REGISTRY")"
-bake "$YAML_FILE" "harbor_project: '$HARBOR_PROJECT'" \
+bake "$YAML_FILE" 'harbor_project: "applications"' \
   "  harbor_project: $(yaml_quote "$HARBOR_PROJECT")"
-bake "$YAML_FILE" "image: 'template'" \
+bake "$YAML_FILE" 'image: "template"' \
   "  image: $(yaml_quote "$PROJECT_NAME")"
 bake "$YAML_FILE" "port: 3000" \
   "  port: ${CONTAINER_PORT}"
-bake "$YAML_FILE" "hostname: 'template.dev.facuynati.website'" \
+bake "$YAML_FILE" 'hostname: "template.dev.facuynati.website"' \
   "    hostname: $(yaml_quote "$DEV_HOSTNAME")"
-bake "$YAML_FILE" "hostname: 'template.facuynati.website'" \
+bake "$YAML_FILE" 'hostname: "template.facuynati.website"' \
   "    hostname: $(yaml_quote "$PROD_HOSTNAME")"
-bake "$YAML_FILE" "target: 'proxmox-dev'" \
+bake "$YAML_FILE" 'target: "proxmox-dev"' \
   "    target: $(yaml_quote "$DEV_TARGET")"
-bake "$YAML_FILE" "target: 'proxmox-prod'" \
+bake "$YAML_FILE" 'target: "proxmox-prod"' \
   "    target: $(yaml_quote "$PROD_TARGET")"
 
 git -C "$TARGET_DIR" check-ignore -q .env ||
