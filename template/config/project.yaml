@@ -9,15 +9,15 @@
 # ============================================================
 
 project:
-  name: 'template'
-  description: 'repo template'
-  repository: 'repo-template'
-  organization: 'Facu-HomeLab'
+  name: "template"
+  description: "repo template"
+  repository: "repo-template"
+  organization: "Facu-HomeLab"
 
 container:
-  registry: 'reg.internal.facuynati.website'
-  harbor_project: 'applications'
-  image: 'template'
+  registry: "reg.internal.facuynati.website"
+  harbor_project: "applications"
+  image: "template"
   port: 3000
 
 deployment:
@@ -25,16 +25,16 @@ deployment:
 
   dev:
     enabled: true
-    hostname: 'template.dev.facuynati.online'
+    hostname: "template.dev.facuynati.website"
     environment: development
-    target: 'proxmox-dev'
+    target: "proxmox-dev"
 
   prod:
     enabled: true
-    hostname: 'template.facuynati.online'
+    hostname: "template.facuynati.website"
     environment: production
-    target: 'proxmox-prod'
+    target: "proxmox-prod"
 
 healthcheck:
-  path: '/health'
+  path: "/health"
   interval: 30

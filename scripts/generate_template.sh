@@ -135,8 +135,8 @@ if [[ "$CLI_MODE" == false ]]; then
   prompt_value PROJECT_NAME "Project name" "my-project"
   validate_project_name "$PROJECT_NAME"
   prompt_value DESCRIPTION "Project description" "$PROJECT_NAME"
-  prompt_value DEV_HOSTNAME "Development hostname" "${PROJECT_NAME}.dev.facuynati.online"
-  prompt_value PROD_HOSTNAME "Production hostname" "${PROJECT_NAME}.facuynati.online"
+  prompt_value DEV_HOSTNAME "Development hostname" "${PROJECT_NAME}.dev.facuynati.website"
+  prompt_value PROD_HOSTNAME "Production hostname" "${PROJECT_NAME}.facuynati.website"
   prompt_value DEV_TARGET "Development deployment target" "proxmox-dev"
   prompt_value PROD_TARGET "Production deployment target" "proxmox-prod"
 else
@@ -294,9 +294,9 @@ bake "$YAML_FILE" "image: 'template'" \
   "  image: $(yaml_quote "$PROJECT_NAME")"
 bake "$YAML_FILE" "port: 3000" \
   "  port: ${CONTAINER_PORT}"
-bake "$YAML_FILE" "hostname: 'template.dev.facuynati.online'" \
+bake "$YAML_FILE" "hostname: 'template.dev.facuynati.website'" \
   "    hostname: $(yaml_quote "$DEV_HOSTNAME")"
-bake "$YAML_FILE" "hostname: 'template.facuynati.online'" \
+bake "$YAML_FILE" "hostname: 'template.facuynati.website'" \
   "    hostname: $(yaml_quote "$PROD_HOSTNAME")"
 bake "$YAML_FILE" "target: 'proxmox-dev'" \
   "    target: $(yaml_quote "$DEV_TARGET")"

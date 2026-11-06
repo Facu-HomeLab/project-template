@@ -27,8 +27,8 @@ Non-interactive (all six options are required):
 ./scripts/generate_template.sh \
   --name my-project \
   --description "My project" \
-  --dev-hostname my-project.dev.facuynati.online \
-  --prod-hostname my-project.facuynati.online \
+  --dev-hostname my-project.dev.facuynati.website \
+  --prod-hostname my-project.facuynati.website \
   --dev-target proxmox-dev \
   --prod-target proxmox-prod
 ```
@@ -72,7 +72,7 @@ committed — the script verifies that first.
 ## Notes
 
 - Interactive defaults derive hostnames from the project name
-  (`<name>.dev.facuynati.online` / `<name>.facuynati.online`) and targets
+  (`<name>.dev.facuynati.website` / `<name>.facuynati.website`) and targets
   `proxmox-dev` / `proxmox-prod`.
 - The `Dockerfile` and GitHub Actions workflows are copied as-is, not modified.
 - `SOURCE_REPO` and `SOURCE_BRANCH` can be overridden via environment variables
